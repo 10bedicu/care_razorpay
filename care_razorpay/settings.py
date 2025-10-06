@@ -100,11 +100,13 @@ class PluginSettings:  # pragma: no cover
 REQUIRED_SETTINGS = {
     "RAZORPAY_KEY_ID",
     "RAZORPAY_KEY_SECRET",
+    "RAZORPAY_WEBHOOK_SECRET",
 }
 
 DEFAULTS = {
     "RAZORPAY_KEY_ID": "",
     "RAZORPAY_KEY_SECRET": "",
+    "RAZORPAY_WEBHOOK_SECRET": "",
 }
 
 plugin_settings = PluginSettings(

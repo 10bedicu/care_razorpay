@@ -79,6 +79,7 @@ The following configurations variables are available for Care Razorpay:
 
 - `RAZORPAY_KEY_ID`: Razorpay API key
 - `RAZORPAY_KEY_SECRET`: Razorpay API secret
+- `RAZORPAY_WEBHOOK_SECRET`: Razorpay webhook secret
 
 The plugin will try to find the API key from the config first and then from the environment variable.
 
