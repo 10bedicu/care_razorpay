@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from django.core.validators import validate_email
-from pydantic import UUID4, BaseModel, field_validator
+from pydantic import UUID4, BaseModel, field_validator, model_validator
 
 from care.emr.models.invoice import Invoice
 from care.utils.models.validators import mobile_validator
@@ -40,14 +40,13 @@ class CreatePaymentLinkRequest(BaseModel):
             raise ValueError("Invalid email") from e
         return value
 
-    @field_validator("is_partial_payment_allowed")
-    @classmethod
-    def validate_is_partial_payment_allowed(cls, value):
-        if value and not cls.minimum_down_payment:
+    @model_validator(mode="after")
+    def validate_minimum_down_payment(self):
+        if self.is_partial_payment_allowed and not self.minimum_down_payment:
             raise ValueError(
                 "Minimum down payment is required when partial payment is allowed"
             )
-        return value
+        return self
 
 
 class CreatePaymentLinkResponse(BaseModel):
