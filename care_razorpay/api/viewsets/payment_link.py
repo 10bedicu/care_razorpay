@@ -8,7 +8,7 @@ from care.emr.api.viewsets.base import emr_exception_handler
 from care.emr.models.invoice import Invoice
 from care_razorpay.care_razorpay.api.serializers.payment_link import (
     CreatePaymentLinkRequest,
-    CreatePaymentLinkResponse,
+    PaymentLink,
 )
 from care_razorpay.utils.razorpay import razorpay_client
 
@@ -20,9 +20,27 @@ class PaymentLinkViewSet(GenericViewSet):
         return emr_exception_handler
 
     @extend_schema(
+        description="Retrieve a Razorpay payment link",
+        responses={200: PaymentLink},
+    )
+    def retrieve(self, request, pk):
+        try:
+            payment_link = razorpay_client.payment_link.fetch(pk)
+        except Exception as e:
+            return Response(
+                {"detail": str(e)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            PaymentLink.model_validate(payment_link).model_dump(),
+            status=status.HTTP_200_OK,
+        )
+
+    @extend_schema(
         description="Create a Razorpay payment link",
         request=CreatePaymentLinkRequest,
-        responses={200: CreatePaymentLinkResponse},
+        responses={200: PaymentLink},
     )
     def create(self, request):
         data = CreatePaymentLinkRequest.model_validate(request.data)
@@ -47,7 +65,13 @@ class PaymentLinkViewSet(GenericViewSet):
                         "email": data.email is not None,
                     },
                     "reminder_enable": True,
-                    "reference_id": str(invoice.external_id),
+                    "expire_by": int((data.expires_at).timestamp()),
+                    "notes": {
+                        "invoice_id": str(invoice.external_id),
+                        "account_id": str(invoice.account.external_id),
+                        "patient_id": str(invoice.patient.external_id),
+                        "facility_id": str(invoice.facility.external_id),
+                    },
                 }
             )
         except Exception as e:
@@ -57,6 +81,6 @@ class PaymentLinkViewSet(GenericViewSet):
             )
 
         return Response(
-            CreatePaymentLinkResponse.model_validate(payment_link).model_dump(),
+            PaymentLink.model_validate(payment_link).model_dump(),
             status=status.HTTP_201_CREATED,
         )

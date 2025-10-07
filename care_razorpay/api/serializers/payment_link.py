@@ -1,4 +1,5 @@
-from datetime import datetime
+from datetime import UTC, datetime
+from enum import Enum
 
 from django.core.validators import validate_email
 from pydantic import UUID4, BaseModel, field_validator, model_validator
@@ -40,6 +41,15 @@ class CreatePaymentLinkRequest(BaseModel):
             raise ValueError("Invalid email") from e
         return value
 
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expires_at(cls, value):
+        if value:
+            now = datetime.now(UTC)
+            if value <= now:
+                raise ValueError("Expiration date must be in the future")
+        return value
+
     @model_validator(mode="after")
     def validate_minimum_down_payment(self):
         if self.is_partial_payment_allowed and not self.minimum_down_payment:
@@ -49,6 +59,35 @@ class CreatePaymentLinkRequest(BaseModel):
         return self
 
 
-class CreatePaymentLinkResponse(BaseModel):
+class PaymentLinkStatus(str, Enum):
+    CREATED = "created"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+    PAID = "paid"
+    PARTIALLY_PAID = "partially_paid"
+
+
+class PaymentLink(BaseModel):
     id: str
     short_url: str
+    expire_by: datetime | None = None
+    created_at: datetime
+    amount: float
+    amount_paid: float
+    status: PaymentLinkStatus
+
+    @field_validator("expire_by", mode="before")
+    @classmethod
+    def convert_expire_by_to_datetime(cls, value):
+        if value is None or value == 0:
+            return None
+        if isinstance(value, int):
+            return datetime.fromtimestamp(value, tz=UTC)
+        return value
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def convert_created_at_to_datetime(cls, value):
+        if isinstance(value, int):
+            return datetime.fromtimestamp(value, tz=UTC)
+        return value

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
@@ -45,7 +45,16 @@ class WebhookViewSet(GenericViewSet):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            invoice = Invoice.objects.get(external_id=payment_link.get("reference_id"))
+            notes = payment_link.get("notes", {})
+            invoice_id = notes.get("invoice_id")
+            invoice = Invoice.objects.filter(external_id=invoice_id).first()
+
+            if not invoice:
+                return Response(
+                    {"detail": "Invoice not found"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             payment_reconciliation = PaymentReconciliation.objects.create(
                 target_invoice=invoice,
                 facility=invoice.facility,
@@ -56,7 +65,7 @@ class WebhookViewSet(GenericViewSet):
                 issuer_type=PaymentReconciliationIssuerTypeOptions.patient.value,
                 outcome=PaymentReconciliationOutcomeOptions.complete.value,
                 method=PaymentReconciliationPaymentMethodOptions.cash.value,
-                payment_datetime=datetime.fromtimestamp(payment.get("created_at")),
+                payment_datetime=datetime.fromtimestamp(payment.get("created_at"), UTC),
                 amount=payment.get("amount") / 100,
                 tendered_amount=payment.get("amount") / 100,
                 returned_amount=0,
