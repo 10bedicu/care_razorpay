@@ -91,3 +91,8 @@ class PaymentLink(BaseModel):
         if isinstance(value, int):
             return datetime.fromtimestamp(value, tz=UTC)
         return value
+
+    @field_validator("amount", "amount_paid")
+    @classmethod
+    def convert_amount_to_float(cls, value):
+        return value / 100
