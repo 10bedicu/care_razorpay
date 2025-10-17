@@ -47,6 +47,12 @@ class PaymentLinkViewSet(GenericViewSet):
 
         invoice = Invoice.objects.get(external_id=data.invoice_id)
 
+        if not hasattr(invoice.facility, "razorpayaccount"):
+            return Response(
+                {"detail": "Razorpay account not found for facility"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         try:
             payment_link = razorpay_client.payment_link.create(
                 {
@@ -73,6 +79,27 @@ class PaymentLinkViewSet(GenericViewSet):
                         "account_id": str(invoice.account.external_id),
                         "patient_id": str(invoice.patient.external_id),
                         "facility_id": str(invoice.facility.external_id),
+                    },
+                    "options": {
+                        "checkout": {
+                            "method": {
+                                "netbanking": True,
+                                "card": True,
+                            }
+                        },
+                        "order": [
+                            {
+                                "account": invoice.facility.razorpayaccount.account_id,
+                                "amount": float(invoice.total_gross) * 100,
+                                "currency": "INR",
+                                "notes": {
+                                    "invoice_id": str(invoice.external_id),
+                                    "account_id": str(invoice.account.external_id),
+                                    "patient_id": str(invoice.patient.external_id),
+                                    "facility_id": str(invoice.facility.external_id),
+                                },
+                            }
+                        ],
                     },
                 }
             )

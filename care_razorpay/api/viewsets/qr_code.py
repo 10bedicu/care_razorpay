@@ -47,6 +47,14 @@ class QRCodeViewSet(GenericViewSet):
 
         invoice = Invoice.objects.get(external_id=data.invoice_id)
 
+        if not hasattr(invoice.facility, "razorpayaccount"):
+            return Response(
+                {"detail": "Razorpay account not found for facility"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # TODO: handle account transfer for QR code
+
         try:
             qr_code = razorpay_client.qrcode.create(
                 {
