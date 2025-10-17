@@ -87,19 +87,23 @@ class PaymentLinkViewSet(GenericViewSet):
                                 "card": True,
                             }
                         },
-                        "order": [
-                            {
-                                "account": invoice.facility.razorpayaccount.account_id,
-                                "amount": float(invoice.total_gross) * 100,
-                                "currency": "INR",
-                                "notes": {
-                                    "invoice_id": str(invoice.external_id),
-                                    "account_id": str(invoice.account.external_id),
-                                    "patient_id": str(invoice.patient.external_id),
-                                    "facility_id": str(invoice.facility.external_id),
-                                },
-                            }
-                        ],
+                        "order": {
+                            "transfers": [
+                                {
+                                    "account": invoice.facility.razorpayaccount.account_id,
+                                    "amount": float(invoice.total_gross) * 100,
+                                    "currency": "INR",
+                                    "notes": {
+                                        "invoice_id": str(invoice.external_id),
+                                        "account_id": str(invoice.account.external_id),
+                                        "patient_id": str(invoice.patient.external_id),
+                                        "facility_id": str(
+                                            invoice.facility.external_id
+                                        ),
+                                    },
+                                }
+                            ]
+                        },
                     },
                 }
             )
