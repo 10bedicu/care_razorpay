@@ -1,10 +1,10 @@
 from rest_framework.routers import DefaultRouter
 
 from care_razorpay.api.viewsets.health_check import HealthCheckViewSet
+from care_razorpay.api.viewsets.payment_link import PaymentLinkViewSet
+from care_razorpay.api.viewsets.qr_code import QRCodeViewSet
 from care_razorpay.api.viewsets.razorpay_account import RazorpayAccountViewSet
-from care_razorpay.care_razorpay.api.viewsets.payment_link import PaymentLinkViewSet
-from care_razorpay.care_razorpay.api.viewsets.qr_code import QRCodeViewSet
-from care_razorpay.care_razorpay.api.viewsets.webhook import WebhookViewSet
+from care_razorpay.api.viewsets.webhook import WebhookViewSet
 
 router = DefaultRouter()
 

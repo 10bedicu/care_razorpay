@@ -6,10 +6,7 @@ from rest_framework.viewsets import GenericViewSet
 
 from care.emr.api.viewsets.base import emr_exception_handler
 from care.emr.models.invoice import Invoice
-from care_razorpay.care_razorpay.api.serializers.qr_code import (
-    CreateQRCodeRequest,
-    QRCode,
-)
+from care_razorpay.api.serializers.qr_code import CreateQRCodeRequest, QRCode
 from care_razorpay.utils.razorpay import razorpay_client
 
 

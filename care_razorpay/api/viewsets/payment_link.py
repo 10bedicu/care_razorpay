@@ -6,7 +6,7 @@ from rest_framework.viewsets import GenericViewSet
 
 from care.emr.api.viewsets.base import emr_exception_handler
 from care.emr.models.invoice import Invoice
-from care_razorpay.care_razorpay.api.serializers.payment_link import (
+from care_razorpay.api.serializers.payment_link import (
     CreatePaymentLinkRequest,
     PaymentLink,
 )
