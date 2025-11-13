@@ -1,10 +1,12 @@
+from django.db.models import Q
 from rest_framework import serializers, status
 from rest_framework.decorators import action
 from rest_framework.mixins import CreateModelMixin, RetrieveModelMixin, UpdateModelMixin
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
 
-from care.utils.queryset.facility import get_facility_queryset
+from care.emr.models.organization import FacilityOrganizationUser, OrganizationUser
+from care.facility.models import Facility
 from care_razorpay.api.permissions import IsSuperUserOrReadOnly
 from care_razorpay.api.serializers.razorpay_account import RazorpayAccountSerializer
 from care_razorpay.models.razorpay_account import RazorpayAccount
@@ -22,9 +24,28 @@ class RazorpayAccountViewSet(
     serializer_class = RazorpayAccountSerializer
     lookup_field = "facility__external_id"
 
+    def get_facility_queryset(self):
+        qs = Facility.objects.all()
+        if self.request.user.is_superuser:
+            return qs
+
+        organization_ids = list(
+            OrganizationUser.objects.filter(user=self.request.user).values_list(
+                "organization_id", flat=True
+            )
+        )
+        return qs.filter(
+            Q(
+                id__in=FacilityOrganizationUser.objects.filter(
+                    user=self.request.user
+                ).values_list("organization__facility_id")
+            )
+            | Q(geo_organization_cache__overlap=organization_ids)
+        )
+
     def get_queryset(self):
         queryset = self.queryset
-        facilities = get_facility_queryset(self.request.user)
+        facilities = self.get_facility_queryset()
         return queryset.filter(facility__in=facilities)
 
     def sync_razorpay_account(
