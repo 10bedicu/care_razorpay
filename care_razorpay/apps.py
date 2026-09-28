@@ -15,7 +15,7 @@ class CareRazorpayConfig(AppConfig):
     def ready(self):
         # Register the scan-and-pay provider only if the ABDM plug is installed.
         try:
-            import care_razorpay.scan_pay  # noqa: F401
+            import care_razorpay.provider  # noqa: F401
         except ImportError:
             logger.info(
                 "care_abdm not installed; skipping Razorpay scan-and-pay provider registration"

@@ -6,6 +6,7 @@ from rest_framework.viewsets import GenericViewSet
 
 from care.emr.api.viewsets.base import emr_exception_handler
 from care.emr.models.invoice import Invoice
+from care_razorpay import payments
 from care_razorpay.api.serializers.payment_link import (
     CreatePaymentLinkRequest,
     PaymentLink,
@@ -47,67 +48,19 @@ class PaymentLinkViewSet(GenericViewSet):
 
         invoice = Invoice.objects.get(external_id=data.invoice_id)
 
-        if not hasattr(invoice.facility, "razorpayaccount"):
-            return Response(
-                {"detail": "Razorpay account not found for facility"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
         try:
-            payment_link = razorpay_client.payment_link.create(
-                {
-                    "amount": float(invoice.total_gross) * 100,
-                    "currency": "INR",
-                    "accept_partial": data.is_partial_payment_allowed,
-                    "first_min_partial_amount": data.minimum_down_payment,
-                    "description": invoice.title,
-                    "customer": {
-                        "name": invoice.patient.name,
-                        "email": data.email,
-                        "contact": data.phone_number,
-                    },
-                    "notify": {
-                        "sms": data.phone_number is not None,
-                        "email": data.email is not None,
-                    },
-                    "reminder_enable": True,
-                    "expire_by": int((data.expires_at).timestamp())
-                    if data.expires_at
-                    else None,
-                    "notes": {
-                        "invoice_id": str(invoice.external_id),
-                        "account_id": str(invoice.account.external_id),
-                        "patient_id": str(invoice.patient.external_id),
-                        "facility_id": str(invoice.facility.external_id),
-                    },
-                    "options": {
-                        "checkout": {
-                            "method": {
-                                "netbanking": True,
-                                "card": True,
-                            }
-                        },
-                        "order": {
-                            "transfers": [
-                                {
-                                    "account": invoice.facility.razorpayaccount.account_id,
-                                    "amount": float(invoice.total_gross) * 100,
-                                    "currency": "INR",
-                                    "notes": {
-                                        "invoice_id": str(invoice.external_id),
-                                        "account_id": str(invoice.account.external_id),
-                                        "patient_id": str(invoice.patient.external_id),
-                                        "facility_id": str(
-                                            invoice.facility.external_id
-                                        ),
-                                    },
-                                }
-                            ]
-                        },
-                    },
-                }
+            _payment, payment_link = payments.create_payment(
+                invoice,
+                accept_partial=data.is_partial_payment_allowed,
+                minimum_down_payment=data.minimum_down_payment,
+                email=data.email,
+                phone_number=data.phone_number,
+                notify_sms=data.phone_number is not None,
+                notify_email=data.email is not None,
+                reminder_enable=True,
+                expires_at=data.expires_at,
             )
-        except Exception as e:
+        except payments.RazorpayError as e:
             return Response(
                 {"detail": str(e)},
                 status=status.HTTP_400_BAD_REQUEST,
