@@ -110,6 +110,12 @@ DEFAULTS = {
     "RAZORPAY_POLLING_ENABLED": True,
     "RAZORPAY_POLLING_INTERVAL": 10,
     "RAZORPAY_PAYMENT_MAX_AGE": 3600,
+    # keep polling a locally expired link this long for late gateway updates
+    "RAZORPAY_EXPIRY_GRACE_SECONDS": 900,
+    # give up waiting for an unreachable gateway this long after the deadline
+    "RAZORPAY_EXPIRY_HARD_CAP_SECONDS": 86400,
+    "RAZORPAY_WEBHOOK_REPLAY_INTERVAL": 60,
+    "RAZORPAY_WEBHOOK_MAX_ATTEMPTS": 5,
 }
 
 plugin_settings = PluginSettings(

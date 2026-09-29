@@ -1,11 +1,13 @@
 from drf_spectacular.utils import extend_schema
 from rest_framework import status
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet
 
 from care.emr.api.viewsets.base import emr_exception_handler
-from care.emr.models.invoice import Invoice
+from care_razorpay import payments
+from care_razorpay.api.collection import collectible_invoice
 from care_razorpay.api.serializers.qr_code import CreateQRCodeRequest, QRCode
 from care_razorpay.utils.razorpay import razorpay_client
 
@@ -41,14 +43,16 @@ class QRCodeViewSet(GenericViewSet):
     )
     def create(self, request):
         data = CreateQRCodeRequest.model_validate(request.data)
-
-        invoice = Invoice.objects.get(external_id=data.invoice_id)
+        invoice = collectible_invoice(request.user, data.invoice_id)
 
         if not hasattr(invoice.facility, "razorpayaccount"):
             return Response(
                 {"detail": "Razorpay account not found for facility"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        outstanding = payments.invoice_outstanding(invoice)
+        if outstanding <= 0:
+            raise ValidationError("Invoice has no outstanding balance")
 
         # TODO: handle account transfer for QR code
 
@@ -59,7 +63,7 @@ class QRCodeViewSet(GenericViewSet):
                     "name": invoice.title or f"Invoice {invoice.external_id}",
                     "usage": data.usage.value,
                     "fixed_amount": data.is_amount_fixed,
-                    "payment_amount": float(invoice.total_gross) * 100
+                    "payment_amount": payments.amount_paise(outstanding)
                     if data.is_amount_fixed
                     else None,
                     "description": invoice.title,

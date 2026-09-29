@@ -3,8 +3,6 @@ from enum import Enum
 
 from pydantic import UUID4, BaseModel, field_validator, model_validator
 
-from care.emr.models.invoice import Invoice
-
 
 class QRCodeUsage(str, Enum):
     SINGLE_USE = "single_use"
@@ -16,13 +14,6 @@ class CreateQRCodeRequest(BaseModel):
     usage: QRCodeUsage
     is_amount_fixed: bool
     closes_at: datetime | None = None
-
-    @field_validator("invoice_id")
-    @classmethod
-    def validate_invoice_id(cls, value):
-        if value and not Invoice.objects.filter(external_id=value).exists():
-            raise ValueError("Invoice not found")
-        return value
 
     @field_validator("closes_at")
     @classmethod

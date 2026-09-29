@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 def reconcile_abdm_event(payment_link: dict, payment: dict | None, event: str) -> bool:
     """Reconcile an ABDM scan-and-pay order from a Razorpay webhook.
 
-    Returns True when the link matches an unpaid scan-and-pay order. Partial
-    payments are left for the invoice-notes fallback, which records the actual
-    amount instead of the full invoice total.
+    Returns True when the link matches a scan-and-pay order. Partial payments
+    are left for the invoice-notes fallback, which records the actual amount
+    instead of the full invoice total.
     """
     if event != "payment_link.paid":
         return False
@@ -34,7 +34,6 @@ def reconcile_abdm_event(payment_link: dict, payment: dict | None, event: str) -
 
     order = (
         PaymentOrder.objects.filter(payment_link_id=link_id)
-        .exclude(status__in=PAYMENT_ORDER_PAID_STATUSES)
         .select_related("invoice__account", "health_facility__facility")
         .first()
     )
@@ -42,7 +41,12 @@ def reconcile_abdm_event(payment_link: dict, payment: dict | None, event: str) -
         return False
 
     reference = (payment or {}).get("id") or link_id
-    create_payment_reconciliation(order, reference)
+    amount = (payment or {}).get("amount")
+    create_payment_reconciliation(
+        order,
+        reference,
+        amount=payments.paise_to_rupees(amount) if amount is not None else None,
+    )
     return True
 
 
@@ -58,6 +62,7 @@ class RazorpayProvider(PaymentProvider):
             "order_number": invoice.number or str(invoice.external_id),
             "payment_link_id": link["id"],
             "payment_url": link["short_url"],
+            "amount": invoice.total_gross,
         }
 
     def reconcile_order(self, order) -> None:
@@ -71,7 +76,12 @@ class RazorpayProvider(PaymentProvider):
         status = (link.get("status") or "").lower()
         if status == "paid":
             reference = payments.payment_reference(link, order.payment_link_id)
-            create_payment_reconciliation(order, reference)
+            amount_paid = link.get("amount_paid")
+            create_payment_reconciliation(
+                order,
+                reference,
+                amount=payments.paise_to_rupees(amount_paid) if amount_paid else None,
+            )
             return
 
         expires_at = payments.link_expires_at(link)

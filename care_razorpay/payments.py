@@ -1,7 +1,9 @@
 import logging
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
+from django.db import transaction
+from django.db.models import Q, Sum
 from django.utils.dateparse import parse_datetime
 
 from care.emr.models.payment_reconciliation import PaymentReconciliation
@@ -14,7 +16,10 @@ from care.emr.resources.payment_reconciliation.spec import (
     PaymentReconciliationStatusOptions,
     PaymentReconciliationTypeOptions,
 )
+from care.utils.lock import ObjectLocked
+from care.utils.rounding.rounding import care_round
 from care.utils.time_util import care_now
+from care_razorpay.locks import RazorpayPaymentLock
 from care_razorpay.models import RazorpayPayment
 from care_razorpay.settings import plugin_settings as settings
 from care_razorpay.utils.razorpay import razorpay_client
@@ -25,7 +30,6 @@ OPEN_STATUSES = {
     RazorpayPayment.Status.CREATED,
     RazorpayPayment.Status.PARTIALLY_PAID,
 }
-SETTLEABLE_STATUSES = OPEN_STATUSES | {RazorpayPayment.Status.EXPIRED}
 MIN_EXPIRY_SECONDS = 15 * 60
 
 
@@ -46,6 +50,7 @@ def link_expires_at(link: dict) -> datetime | None:
 
 
 def payment_deadline(payment: RazorpayPayment) -> datetime | None:
+    """When the link stops being payable at the gateway."""
     if payment.expires_at:
         return payment.expires_at
     if payment.created_date:
@@ -55,12 +60,37 @@ def payment_deadline(payment: RazorpayPayment) -> datetime | None:
     return None
 
 
+def polling_deadline(payment: RazorpayPayment) -> datetime | None:
+    """Deadline plus a grace period for the gateway to report a last-second payment."""
+    deadline = payment_deadline(payment)
+    if not deadline:
+        return None
+    return deadline + timedelta(seconds=settings.RAZORPAY_EXPIRY_GRACE_SECONDS)
+
+
 def amount_paise(amount) -> int:
-    return int(round(float(amount) * 100))
+    return int(
+        (Decimal(str(amount)) * 100).quantize(Decimal(1), rounding=ROUND_HALF_UP)
+    )
 
 
 def paise_to_rupees(paise) -> Decimal:
     return Decimal(str(paise)) / Decimal(100)
+
+
+def invoice_outstanding(invoice) -> Decimal:
+    """Invoice total less settled payments, plus credit notes (as the account does)."""
+    totals = PaymentReconciliation.objects.filter(
+        target_invoice=invoice,
+        status=PaymentReconciliationStatusOptions.active.value,
+        outcome=PaymentReconciliationOutcomeOptions.complete.value,
+    ).aggregate(
+        paid=Sum("amount", filter=Q(is_credit_note=False)),
+        credited=Sum("amount", filter=Q(is_credit_note=True)),
+    )
+    paid = totals["paid"] or Decimal(0)
+    credited = totals["credited"] or Decimal(0)
+    return care_round(Decimal(invoice.total_gross) - paid + credited)
 
 
 def invoice_notes(invoice) -> dict:
@@ -81,6 +111,7 @@ def route_account(invoice):
 def create_gateway_link(
     invoice,
     *,
+    amount=None,
     accept_partial: bool = False,
     minimum_down_payment=None,
     email: str | None = None,
@@ -92,7 +123,7 @@ def create_gateway_link(
 ) -> dict:
     """Create a Razorpay payment link that settles to the facility route account."""
     account = route_account(invoice)
-    paise = amount_paise(invoice.total_gross)
+    paise = amount_paise(invoice.total_gross if amount is None else amount)
     notes = invoice_notes(invoice)
     contact = phone_number or getattr(invoice.patient, "phone_number", None)
     customer = {"name": invoice.patient.name}
@@ -140,17 +171,47 @@ def create_gateway_link(
     return link
 
 
-def create_payment(invoice, **options) -> tuple[RazorpayPayment, dict]:
-    """Generate a Razorpay payment link for an invoice and persist it."""
-    link = create_gateway_link(invoice, **options)
+def create_payment(
+    invoice, amount: Decimal | None = None, **options
+) -> tuple[RazorpayPayment, dict]:
+    """Generate a Razorpay payment link for an invoice and persist it.
+
+    Defaults to the invoice's outstanding balance so a partially settled
+    invoice is never charged in full again.
+    """
+    amount = care_round(amount if amount is not None else invoice_outstanding(invoice))
+    if amount <= 0:
+        raise RazorpayError("Invoice has no outstanding balance")
+    link = create_gateway_link(invoice, amount=amount, **options)
     payment = RazorpayPayment.objects.create(
         payment_link_id=link["id"],
         invoice=invoice,
-        amount=invoice.total_gross,
+        amount=amount,
         payment_url=link.get("short_url") or "",
         expires_at=link_expires_at(link),
     )
     return payment, link
+
+
+def pending_payment(invoice) -> RazorpayPayment | None:
+    """The invoice's newest link that is still payable at the gateway, if any."""
+    now = care_now()
+    for payment in RazorpayPayment.objects.filter(
+        invoice=invoice, status__in=OPEN_STATUSES
+    ).order_by("-created_date"):
+        deadline = payment_deadline(payment)
+        if not deadline or deadline > now:
+            return payment
+    return None
+
+
+def supersede(payment: RazorpayPayment) -> bool:
+    """Retire a live link that no longer matches what the invoice needs.
+
+    If the gateway still collects on it, the payment settles and is flagged
+    for review.
+    """
+    return _mark(payment, RazorpayPayment.Status.SUPERSEDED)
 
 
 def _payment_items(raw) -> list:
@@ -196,13 +257,19 @@ def payment_reference(link: dict, fallback: str = "") -> str:
 
 
 def _record_reconciliation(payment: RazorpayPayment, reference, amount, paid_at=None):
-    if reference and PaymentReconciliation.objects.filter(
-        target_invoice=payment.invoice,
-        reference_number=reference,
-    ).exists():
+    if (
+        reference
+        and PaymentReconciliation.objects.filter(
+            target_invoice=payment.invoice,
+            reference_number=reference,
+        ).exists()
+    ):
         return
     invoice = payment.invoice
-    payment_reconciliation = PaymentReconciliation.objects.create(
+    note = "Payment made via Razorpay's payment link."
+    if payment.needs_review:
+        note += f" Needs review: {payment.review_reason}"
+    PaymentReconciliation.objects.create(
         target_invoice=invoice,
         facility=invoice.facility,
         account=invoice.account,
@@ -219,13 +286,14 @@ def _record_reconciliation(payment: RazorpayPayment, reference, amount, paid_at=
         is_credit_note=False,
         authorization="",
         disposition="",
-        note="Payment made via Razorpay's payment link.",
+        note=note,
         reference_number=reference or "",
     )
-    rebalance_account_task.delay(payment_reconciliation.account.id)
+    account_id = invoice.account_id
+    transaction.on_commit(lambda: rebalance_account_task.delay(account_id))
 
 
-def _paid_at(payment: dict | None):
+def paid_at(payment: dict | None):
     created_at = (payment or {}).get("created_at")
     if isinstance(created_at, (int, float)):
         return datetime.fromtimestamp(created_at, UTC)
@@ -234,24 +302,76 @@ def _paid_at(payment: dict | None):
     return None
 
 
-def _mark(payment: RazorpayPayment, status: str) -> None:
+def _fresh(payment: RazorpayPayment) -> RazorpayPayment:
+    return RazorpayPayment.objects.select_related(
+        "invoice__account", "invoice__facility"
+    ).get(pk=payment.pk)
+
+
+def _mark(payment: RazorpayPayment, status: str, review: str = "") -> bool:
+    """Move a still-open payment to a terminal unpaid state."""
+    with RazorpayPaymentLock(payment), transaction.atomic():
+        payment = _fresh(payment)
+        if payment.status not in OPEN_STATUSES:
+            return False
+        payment.status = status
+        if review:
+            payment.flag_for_review(review)
+        payment.save(
+            update_fields=["status", "needs_review", "review_reason", "modified_date"]
+        )
+    return True
+
+
+def _prepare_settlement(payment: RazorpayPayment) -> RazorpayPayment | None:
+    """Fresh row to settle, or None when it is already fully paid.
+
+    A verified payment means money moved, so any unpaid row settles; settling
+    from a non-open state (expired, cancelled, superseded) is flagged for
+    review because a replacement link may also have been paid.
+    """
+    payment = _fresh(payment)
+    if payment.status == RazorpayPayment.Status.PAID:
+        return None
     if payment.status not in OPEN_STATUSES:
-        return
-    payment.status = status
-    payment.save(update_fields=["status", "modified_date"])
+        payment.flag_for_review(f"settled from status {payment.status}")
+    return payment
+
+
+def _finish_settlement(payment: RazorpayPayment, reference, *, final: bool) -> None:
+    payment.reference = reference or payment.reference
+    payment.status = (
+        RazorpayPayment.Status.PAID if final else RazorpayPayment.Status.PARTIALLY_PAID
+    )
+    payment.save(
+        update_fields=[
+            "status",
+            "reference",
+            "needs_review",
+            "review_reason",
+            "modified_date",
+        ]
+    )
+    if payment.needs_review:
+        logger.warning(
+            "Razorpay link %s settled but needs review: %s",
+            payment.payment_link_id,
+            payment.review_reason,
+        )
 
 
 def _settle(payment: RazorpayPayment, reference, amount, paid_at, *, final: bool):
-    if payment.status not in SETTLEABLE_STATUSES:
-        return
-    _record_reconciliation(payment, reference, amount, paid_at)
-    payment.reference = reference or payment.reference
-    payment.status = (
-        RazorpayPayment.Status.PAID
-        if final
-        else RazorpayPayment.Status.PARTIALLY_PAID
-    )
-    payment.save(update_fields=["status", "reference", "modified_date"])
+    """Record one confirmed payment against the link, exactly once.
+
+    Runs under the payment lock with a fresh copy of the row so concurrent
+    webhook/polling workers cannot both credit the invoice.
+    """
+    with RazorpayPaymentLock(payment), transaction.atomic():
+        payment = _prepare_settlement(payment)
+        if payment is None:
+            return
+        _record_reconciliation(payment, reference, amount, paid_at)
+        _finish_settlement(payment, reference, final=final)
 
 
 def reconcile_event(payment_link: dict, payment: dict | None, event: str) -> bool:
@@ -275,9 +395,9 @@ def reconcile_event(payment_link: dict, payment: dict | None, event: str) -> boo
         amount = record.amount
 
     if event == "payment_link.paid":
-        _settle(record, reference, amount, _paid_at(payment), final=True)
+        _settle(record, reference, amount, paid_at(payment), final=True)
     elif event == "payment_link.partially_paid":
-        _settle(record, reference, amount, _paid_at(payment), final=False)
+        _settle(record, reference, amount, paid_at(payment), final=False)
     elif event == "payment_link.cancelled":
         _mark(record, RazorpayPayment.Status.CANCELLED)
     elif event == "payment_link.expired":
@@ -307,59 +427,79 @@ def apply_gateway_status(payment: RazorpayPayment, link: dict) -> None:
 
 
 def _settle_from_link(payment: RazorpayPayment, link: dict, *, final: bool) -> None:
-    if payment.status not in OPEN_STATUSES:
-        return
-    captured = captured_payments(link)
-    if captured:
-        for item in captured:
-            _record_reconciliation(
-                payment, item["id"], paise_to_rupees(item["amount"])
-            )
-        reference = captured[-1]["id"]
-    elif final and not payment.reference:
-        amount_paid = link.get("amount_paid")
-        amount = paise_to_rupees(amount_paid) if amount_paid else payment.amount
-        reference = payment.payment_link_id
-        _record_reconciliation(payment, reference, amount)
-    elif final:
-        # A webhook already recorded at least one payment id. The gateway says
-        # the link is fully paid, so close it without adding a second lump sum.
-        reference = payment.reference
-    else:
-        return
-
-    payment.reference = reference or payment.reference
-    payment.status = (
-        RazorpayPayment.Status.PAID
-        if final
-        else RazorpayPayment.Status.PARTIALLY_PAID
-    )
-    payment.save(update_fields=["status", "reference", "modified_date"])
+    with RazorpayPaymentLock(payment), transaction.atomic():
+        payment = _prepare_settlement(payment)
+        if payment is None:
+            return
+        captured = captured_payments(link)
+        if captured:
+            for item in captured:
+                _record_reconciliation(
+                    payment, item["id"], paise_to_rupees(item["amount"])
+                )
+            reference = captured[-1]["id"]
+        elif final and not payment.reference:
+            amount_paid = link.get("amount_paid")
+            amount = paise_to_rupees(amount_paid) if amount_paid else payment.amount
+            reference = payment.payment_link_id
+            _record_reconciliation(payment, reference, amount)
+        elif final:
+            # A webhook already recorded at least one payment id. The gateway says
+            # the link is fully paid, so close it without adding a second lump sum.
+            reference = payment.reference
+        else:
+            return
+        _finish_settlement(payment, reference, final=final)
 
 
-def _check_gateway(payment: RazorpayPayment) -> None:
+def check_gateway(payment: RazorpayPayment) -> bool:
+    """Fetch the link from the gateway once; returns whether it answered."""
     try:
         link = razorpay_client.payment_link.fetch(payment.payment_link_id)
     except Exception:
         logger.exception(
             "Failed to poll Razorpay status for link %s", payment.payment_link_id
         )
-        return
+        return False
     apply_gateway_status(payment, link)
+    return True
+
+
+def _poll(payment: RazorpayPayment, now) -> None:
+    answered = check_gateway(payment)
+    deadline = polling_deadline(payment)
+    if not deadline or deadline > now:
+        return
+    if answered:
+        # the gateway had its final say; a later webhook can still settle the row
+        _mark(payment, RazorpayPayment.Status.EXPIRED)
+        return
+    hard_cap = deadline + timedelta(seconds=settings.RAZORPAY_EXPIRY_HARD_CAP_SECONDS)
+    if hard_cap <= now:
+        _mark(
+            payment,
+            RazorpayPayment.Status.EXPIRED,
+            review="gateway unreachable at expiry; final status unconfirmed",
+        )
 
 
 def poll_pending_payments() -> None:
     """Poll Razorpay for each open payment; expire those past their deadline.
 
-    A payment gets one last gateway check at its deadline so a payment made
-    just before expiry is not missed, then it leaves the polling set for good.
+    A payment is only expired after the gateway answered a query past the
+    deadline (plus grace), so an unreachable gateway cannot make us drop a
+    payment that actually succeeded. Rows being settled by another worker are
+    skipped this cycle.
     """
     now = care_now()
     pending = RazorpayPayment.objects.filter(status__in=OPEN_STATUSES).select_related(
         "invoice__account", "invoice__facility"
     )
     for payment in pending:
-        _check_gateway(payment)
-        deadline = payment_deadline(payment)
-        if deadline and deadline <= now:
-            _mark(payment, RazorpayPayment.Status.EXPIRED)
+        try:
+            _poll(payment, now)
+        except ObjectLocked:
+            logger.info(
+                "Razorpay link %s is being settled elsewhere; skipping",
+                payment.payment_link_id,
+            )

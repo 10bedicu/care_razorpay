@@ -4,7 +4,6 @@ from enum import Enum
 from django.core.validators import validate_email
 from pydantic import UUID4, BaseModel, field_validator, model_validator
 
-from care.emr.models.invoice import Invoice
 from care.utils.models.validators import mobile_validator
 
 
@@ -15,13 +14,6 @@ class CreatePaymentLinkRequest(BaseModel):
     is_partial_payment_allowed: bool = False
     minimum_down_payment: float | None = None
     expires_at: datetime | None = None
-
-    @field_validator("invoice_id")
-    @classmethod
-    def validate_invoice_id(cls, value):
-        if value and not Invoice.objects.filter(external_id=value).exists():
-            raise ValueError("Invoice not found")
-        return value
 
     @field_validator("phone_number")
     @classmethod
