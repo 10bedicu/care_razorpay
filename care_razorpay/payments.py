@@ -25,10 +25,34 @@ OPEN_STATUSES = {
     RazorpayPayment.Status.CREATED,
     RazorpayPayment.Status.PARTIALLY_PAID,
 }
+SETTLEABLE_STATUSES = OPEN_STATUSES | {RazorpayPayment.Status.EXPIRED}
+MIN_EXPIRY_SECONDS = 15 * 60
 
 
 class RazorpayError(Exception):
     pass
+
+
+def default_expires_at() -> datetime:
+    max_age = max(settings.RAZORPAY_PAYMENT_MAX_AGE, MIN_EXPIRY_SECONDS)
+    return care_now() + timedelta(seconds=max_age)
+
+
+def link_expires_at(link: dict) -> datetime | None:
+    expire_by = link.get("expire_by")
+    if isinstance(expire_by, (int, float)) and expire_by > 0:
+        return datetime.fromtimestamp(expire_by, UTC)
+    return None
+
+
+def payment_deadline(payment: RazorpayPayment) -> datetime | None:
+    if payment.expires_at:
+        return payment.expires_at
+    if payment.created_date:
+        return payment.created_date + timedelta(
+            seconds=settings.RAZORPAY_PAYMENT_MAX_AGE
+        )
+    return None
 
 
 def amount_paise(amount) -> int:
@@ -102,8 +126,9 @@ def create_gateway_link(
     }
     if minimum_down_payment is not None:
         payload["first_min_partial_amount"] = minimum_down_payment
-    if expires_at is not None:
-        payload["expire_by"] = int(expires_at.timestamp())
+    if expires_at is None:
+        expires_at = default_expires_at()
+    payload["expire_by"] = int(expires_at.timestamp())
 
     try:
         link = razorpay_client.payment_link.create(payload)
@@ -123,6 +148,7 @@ def create_payment(invoice, **options) -> tuple[RazorpayPayment, dict]:
         invoice=invoice,
         amount=invoice.total_gross,
         payment_url=link.get("short_url") or "",
+        expires_at=link_expires_at(link),
     )
     return payment, link
 
@@ -216,7 +242,7 @@ def _mark(payment: RazorpayPayment, status: str) -> None:
 
 
 def _settle(payment: RazorpayPayment, reference, amount, paid_at, *, final: bool):
-    if payment.status not in OPEN_STATUSES:
+    if payment.status not in SETTLEABLE_STATUSES:
         return
     _record_reconciliation(payment, reference, amount, paid_at)
     payment.reference = reference or payment.reference
@@ -260,13 +286,17 @@ def reconcile_event(payment_link: dict, payment: dict | None, event: str) -> boo
 
 
 def apply_gateway_status(payment: RazorpayPayment, link: dict) -> None:
-    """Move a pending payment based on a fetched payment-link payload."""
+    expires_at = link_expires_at(link)
+    if expires_at and payment.expires_at != expires_at:
+        payment.expires_at = expires_at
+        payment.save(update_fields=["expires_at", "modified_date"])
+
     status = (link.get("status") or "").lower()
     if status in ("paid", "partially_paid"):
         _settle_from_link(payment, link, final=status == "paid")
     elif status == "cancelled":
         _mark(payment, RazorpayPayment.Status.CANCELLED)
-    elif status == "expired":
+    elif status == "expired" or (expires_at and expires_at <= care_now()):
         _mark(payment, RazorpayPayment.Status.EXPIRED)
     else:
         logger.info(
@@ -307,25 +337,29 @@ def _settle_from_link(payment: RazorpayPayment, link: dict, *, final: bool) -> N
     payment.save(update_fields=["status", "reference", "modified_date"])
 
 
+def _check_gateway(payment: RazorpayPayment) -> None:
+    try:
+        link = razorpay_client.payment_link.fetch(payment.payment_link_id)
+    except Exception:
+        logger.exception(
+            "Failed to poll Razorpay status for link %s", payment.payment_link_id
+        )
+        return
+    apply_gateway_status(payment, link)
+
+
 def poll_pending_payments() -> None:
-    """Poll Razorpay for each pending payment; expire stale unpaid ones."""
-    cutoff = care_now() - timedelta(seconds=settings.RAZORPAY_PAYMENT_MAX_AGE)
+    """Poll Razorpay for each open payment; expire those past their deadline.
+
+    A payment gets one last gateway check at its deadline so a payment made
+    just before expiry is not missed, then it leaves the polling set for good.
+    """
+    now = care_now()
     pending = RazorpayPayment.objects.filter(status__in=OPEN_STATUSES).select_related(
         "invoice__account", "invoice__facility"
     )
     for payment in pending:
-        if (
-            payment.status == RazorpayPayment.Status.CREATED
-            and payment.created_date
-            and payment.created_date < cutoff
-        ):
+        _check_gateway(payment)
+        deadline = payment_deadline(payment)
+        if deadline and deadline <= now:
             _mark(payment, RazorpayPayment.Status.EXPIRED)
-            continue
-        try:
-            link = razorpay_client.payment_link.fetch(payment.payment_link_id)
-        except Exception:
-            logger.exception(
-                "Failed to poll Razorpay status for link %s", payment.payment_link_id
-            )
-            continue
-        apply_gateway_status(payment, link)

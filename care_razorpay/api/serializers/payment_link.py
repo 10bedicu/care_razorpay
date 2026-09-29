@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 
 from django.core.validators import validate_email
@@ -45,9 +45,12 @@ class CreatePaymentLinkRequest(BaseModel):
     @classmethod
     def validate_expires_at(cls, value):
         if value:
-            now = datetime.now(UTC)
-            if value <= now:
-                raise ValueError("Expiration date must be in the future")
+            if value.tzinfo is None:
+                raise ValueError("Expiration date must include a timezone")
+            if value < datetime.now(UTC) + timedelta(minutes=15):
+                raise ValueError(
+                    "Expiration date must be at least 15 minutes in the future"
+                )
         return value
 
     @model_validator(mode="after")

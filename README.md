@@ -80,8 +80,21 @@ The following configurations variables are available for Care Razorpay:
 - `RAZORPAY_KEY_ID`: Razorpay API key
 - `RAZORPAY_KEY_SECRET`: Razorpay API secret
 - `RAZORPAY_WEBHOOK_SECRET`: Razorpay webhook secret
+- `RAZORPAY_POLLING_ENABLED`: Enable the Celery status-polling task (default `True`)
+- `RAZORPAY_POLLING_INTERVAL`: Polling interval in seconds (default `10`)
+- `RAZORPAY_PAYMENT_MAX_AGE`: Seconds a payment link stays payable when the
+  request gives no `expires_at` (default `3600`, minimum 15 minutes per Razorpay)
 
 The plugin will try to find the API key from the config first and then from the environment variable.
+
+### Payment link expiry
+
+Every payment link is created with a Razorpay `expire_by` — either the
+`expires_at` passed to `POST /api/care_razorpay/payment_link/` (at least 15
+minutes ahead) or now + `RAZORPAY_PAYMENT_MAX_AGE`. The value Razorpay reports
+back is stored on the payment as `expires_at`. The polling task checks each open
+payment until then, gives it one final check after the expiry and marks it
+`expired`. A `payment_link.paid` webhook still settles a locally expired payment.
 
 ## License
 
