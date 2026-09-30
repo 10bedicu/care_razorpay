@@ -43,7 +43,11 @@ def _paid_event(link_id, payment_id="pay_test", amount=10000, invoice_id=None):
         "event": "payment_link.paid",
         "payload": {
             "payment": {
-                "entity": {"id": payment_id, "amount": amount, "created_at": 1_700_000_000}
+                "entity": {
+                    "id": payment_id,
+                    "amount": amount,
+                    "created_at": 1_700_000_000,
+                }
             },
             "payment_link": {"entity": {"id": link_id, "notes": notes}},
         },
@@ -153,7 +157,9 @@ class TestRazorpayProvider(RazorpayTestBase):
         self.assertEqual(transfer["account"], "acc_test")
         self.assertEqual(transfer["amount"], 10000)
         # scan-and-pay links expire with the local max age instead of Razorpay's 6 months
-        expected = _epoch(care_now() + timedelta(seconds=settings.RAZORPAY_PAYMENT_MAX_AGE))
+        expected = _epoch(
+            care_now() + timedelta(seconds=settings.RAZORPAY_PAYMENT_MAX_AGE)
+        )
         self.assertAlmostEqual(payload["expire_by"], expected, delta=5)
         self.assertFalse(
             RazorpayPayment.objects.filter(payment_link_id="plink_test").exists()
@@ -169,7 +175,7 @@ class TestRazorpayProvider(RazorpayTestBase):
 
         mock_client.payment_link.create.assert_not_called()
 
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     @patch("care_razorpay.payments.razorpay_client")
     def test_reconcile_marks_paid_and_notifies(self, mock_client, mock_task):
         mock_client.payment_link.fetch.return_value = {
@@ -193,7 +199,7 @@ class TestRazorpayProvider(RazorpayTestBase):
         )
         mock_task.assert_called_once()
 
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     @patch("care_razorpay.payments.razorpay_client")
     def test_reconcile_records_amount_paid_not_invoice_total(self, mock_client, _task):
         mock_client.payment_link.fetch.return_value = {
@@ -211,7 +217,7 @@ class TestRazorpayProvider(RazorpayTestBase):
         reconciliation = PaymentReconciliation.objects.get(target_invoice=order.invoice)
         self.assertEqual(reconciliation.amount, Decimal(100))
 
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     @patch("care_razorpay.payments.razorpay_client")
     def test_reconcile_ignores_unpaid(self, mock_client, mock_task):
         mock_client.payment_link.fetch.return_value = {
@@ -230,7 +236,7 @@ class TestRazorpayProvider(RazorpayTestBase):
         )
         mock_task.assert_not_called()
 
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     @patch("care_razorpay.payments.razorpay_client")
     def test_reconcile_fails_expired_order(self, mock_client, mock_task):
         mock_client.payment_link.fetch.return_value = {
@@ -239,7 +245,8 @@ class TestRazorpayProvider(RazorpayTestBase):
         }
         order = self.make_order("plink_test")
 
-        razorpay_provider.RazorpayProvider().reconcile_order(order)
+        with self.captureOnCommitCallbacks(execute=True):
+            razorpay_provider.RazorpayProvider().reconcile_order(order)
 
         order.refresh_from_db()
         self.assertEqual(order.status, PaymentOrderStatus.FAIL)
@@ -249,7 +256,9 @@ class TestRazorpayProvider(RazorpayTestBase):
         self.assertFalse(
             PaymentReconciliation.objects.filter(target_invoice=order.invoice).exists()
         )
-        mock_task.assert_not_called()
+        # the PHR is told the payment failed
+        payload = mock_task.call_args.args[0]
+        self.assertEqual(payload["acknowledgement"]["status"], "FAIL")
 
     @patch("care_razorpay.payments.razorpay_client")
     def test_reconcile_fails_order_past_expire_by(self, mock_client):
@@ -296,9 +305,9 @@ class TestRazorpayStandalonePayment(RazorpayTestBase):
         self.assertEqual(payment.payment_url, "https://rzp.io/standalone")
         self.assertEqual(payment.expires_at, datetime.fromtimestamp(expire_by, UTC))
         self.assertEqual(link["id"], "plink_standalone")
-        transfer = mock_client.payment_link.create.call_args.args[0]["options"]["order"][
-            "transfers"
-        ][0]
+        transfer = mock_client.payment_link.create.call_args.args[0]["options"][
+            "order"
+        ]["transfers"][0]
         self.assertEqual(transfer["account"], "acc_test")
 
     @patch("care_razorpay.payments.razorpay_client")
@@ -311,7 +320,9 @@ class TestRazorpayStandalonePayment(RazorpayTestBase):
         payments.create_payment(self.make_invoice())
 
         payload = mock_client.payment_link.create.call_args.args[0]
-        expected = _epoch(care_now() + timedelta(seconds=settings.RAZORPAY_PAYMENT_MAX_AGE))
+        expected = _epoch(
+            care_now() + timedelta(seconds=settings.RAZORPAY_PAYMENT_MAX_AGE)
+        )
         self.assertAlmostEqual(payload["expire_by"], expected, delta=5)
 
     @patch("care_razorpay.payments.razorpay_client")
@@ -404,7 +415,9 @@ class TestRazorpayStandalonePayment(RazorpayTestBase):
         payments.reconcile_event(*event, "payment_link.paid")
 
         self.assertEqual(
-            PaymentReconciliation.objects.filter(target_invoice=payment.invoice).count(),
+            PaymentReconciliation.objects.filter(
+                target_invoice=payment.invoice
+            ).count(),
             1,
         )
 
@@ -420,7 +433,9 @@ class TestRazorpayStandalonePayment(RazorpayTestBase):
         )
 
         self.assertEqual(
-            PaymentReconciliation.objects.filter(target_invoice=payment.invoice).count(),
+            PaymentReconciliation.objects.filter(
+                target_invoice=payment.invoice
+            ).count(),
             1,
         )
 
@@ -437,7 +452,9 @@ class TestRazorpayStandalonePayment(RazorpayTestBase):
         payment.refresh_from_db()
         self.assertEqual(payment.status, RazorpayPayment.Status.CREATED)
         self.assertFalse(
-            PaymentReconciliation.objects.filter(target_invoice=payment.invoice).exists()
+            PaymentReconciliation.objects.filter(
+                target_invoice=payment.invoice
+            ).exists()
         )
 
     @patch("care_razorpay.payments.rebalance_account_task.delay")
@@ -491,7 +508,9 @@ class TestRazorpayStandalonePayment(RazorpayTestBase):
         self.assertEqual(payment.reference, "pay_late")
         self.assertTrue(payment.needs_review)
         self.assertIn("settled from status expired", payment.review_reason)
-        reconciliation = PaymentReconciliation.objects.get(target_invoice=payment.invoice)
+        reconciliation = PaymentReconciliation.objects.get(
+            target_invoice=payment.invoice
+        )
         self.assertIn("Needs review", reconciliation.note)
         mock_rebalance.assert_called_once()
 
@@ -519,7 +538,9 @@ class TestRazorpayStandalonePayment(RazorpayTestBase):
             "plink_superseded", "INV-SUP", status=RazorpayPayment.Status.SUPERSEDED
         )
 
-        payments.reconcile_event({"id": "plink_superseded"}, None, "payment_link.expired")
+        payments.reconcile_event(
+            {"id": "plink_superseded"}, None, "payment_link.expired"
+        )
 
         payment.refresh_from_db()
         self.assertEqual(payment.status, RazorpayPayment.Status.SUPERSEDED)
@@ -776,7 +797,7 @@ class TestCreatePaymentLinkRequest(RazorpayTestBase):
 
 
 class TestRazorpayWebhookDispatch(RazorpayTestBase):
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     @patch("care_razorpay.payments.rebalance_account_task.delay")
     def test_standalone_payment_is_handled_before_abdm(self, mock_rebalance, mock_task):
         invoice = self.make_invoice("INV-DISPATCH")
@@ -802,7 +823,7 @@ class TestRazorpayWebhookDispatch(RazorpayTestBase):
         reconciliation = PaymentReconciliation.objects.get(target_invoice=invoice)
         self.assertEqual(reconciliation.method, "debc")
 
-    @patch("abdm.signals.scan_pay.scan_pay_notify.delay")
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     def test_unknown_link_falls_through_to_abdm(self, mock_task):
         order = self.make_order("plink_abdm")
 
@@ -846,7 +867,9 @@ class TestRazorpayWebhookDispatch(RazorpayTestBase):
         reconciliation = PaymentReconciliation.objects.get(target_invoice=invoice)
         self.assertEqual(reconciliation.reference_number, "pay_test")
         self.assertEqual(reconciliation.amount, Decimal(100))
-        self.assertEqual(reconciliation.note, "Payment made via Razorpay's payment link.")
+        self.assertEqual(
+            reconciliation.note, "Payment made via Razorpay's payment link."
+        )
         mock_rebalance.assert_called_once()
 
     def test_paid_event_without_payload_is_rejected(self):
@@ -860,10 +883,17 @@ class TestRazorpayWebhookDispatch(RazorpayTestBase):
             "event": "qr_code.credited",
             "payload": {
                 "payment": {
-                    "entity": {"id": "pay_qr", "amount": 2550, "created_at": 1_700_000_000}
+                    "entity": {
+                        "id": "pay_qr",
+                        "amount": 2550,
+                        "created_at": 1_700_000_000,
+                    }
                 },
                 "qr_code": {
-                    "entity": {"id": "qr_1", "notes": {"invoice_id": str(invoice.external_id)}}
+                    "entity": {
+                        "id": "qr_1",
+                        "notes": {"invoice_id": str(invoice.external_id)},
+                    }
                 },
             },
         }
@@ -932,7 +962,9 @@ class TestRazorpayWebhookEndpoint(RazorpayTestBase):
         self.assertEqual((first.status_code, second.status_code), (200, 200))
         self.assertEqual(RazorpayWebhookEvent.objects.count(), 1)
         self.assertEqual(
-            PaymentReconciliation.objects.filter(target_invoice=payment.invoice).count(),
+            PaymentReconciliation.objects.filter(
+                target_invoice=payment.invoice
+            ).count(),
             1,
         )
 
@@ -1157,4 +1189,6 @@ class TestRazorpayCollectionAPI(RazorpayTestBase):
         )
 
         self.client.force_authenticate(user=self.create_user())
-        self.assertEqual(self.client.post(QR_CODE_URL, body, format="json").status_code, 403)
+        self.assertEqual(
+            self.client.post(QR_CODE_URL, body, format="json").status_code, 403
+        )
