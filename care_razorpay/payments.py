@@ -2,6 +2,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
+from django.core.cache import cache
 from django.db import transaction
 from django.db.models import Q, Sum
 from django.utils.dateparse import parse_datetime
@@ -593,8 +594,20 @@ def check_gateway(payment: RazorpayPayment) -> bool:
     return True
 
 
+def backoff_key(payment: RazorpayPayment) -> str:
+    return f"razorpay:backoff:{payment.external_id}"
+
+
 def _poll(payment: RazorpayPayment, now) -> None:
+    if cache.get(backoff_key(payment)):
+        return
     answered = check_gateway(payment)
+    if not answered:
+        cache.set(
+            backoff_key(payment),
+            1,
+            timeout=settings.RAZORPAY_UNREACHABLE_BACKOFF,
+        )
     deadline = polling_deadline(payment)
     if not deadline or deadline > now:
         return

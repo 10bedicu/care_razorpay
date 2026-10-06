@@ -114,6 +114,8 @@ DEFAULTS = {
     "RAZORPAY_EXPIRY_GRACE_SECONDS": 900,
     # give up waiting for an unreachable gateway this long after the deadline
     "RAZORPAY_EXPIRY_HARD_CAP_SECONDS": 86400,
+    # leave a payment alone this long after the gateway failed to answer about it
+    "RAZORPAY_UNREACHABLE_BACKOFF": 120,
     "RAZORPAY_WEBHOOK_REPLAY_INTERVAL": 60,
     "RAZORPAY_WEBHOOK_MAX_ATTEMPTS": 5,
 }

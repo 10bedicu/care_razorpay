@@ -84,6 +84,12 @@ The following configurations variables are available for Care Razorpay:
 - `RAZORPAY_POLLING_INTERVAL`: Polling interval in seconds (default `10`)
 - `RAZORPAY_PAYMENT_MAX_AGE`: Seconds a payment link stays payable when the
   request gives no `expires_at` (default `3600`, minimum 15 minutes per Razorpay)
+- `RAZORPAY_EXPIRY_GRACE_SECONDS`: Keep polling this long after the link expiry
+  for a last-second payment (default `900`)
+- `RAZORPAY_EXPIRY_HARD_CAP_SECONDS`: If Razorpay stays unreachable, expire the
+  payment (flagged for review) this long after the deadline (default `86400`)
+- `RAZORPAY_UNREACHABLE_BACKOFF`: Leave a payment alone this long after Razorpay
+  failed to answer about it (default `120`)
 
 The plugin will try to find the API key from the config first and then from the environment variable.
 

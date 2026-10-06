@@ -1,4 +1,5 @@
 import logging
+from datetime import timedelta
 
 from abdm.models.payment_order import (
     PAYMENT_ORDER_PAID_STATUSES,
@@ -11,6 +12,7 @@ from abdm.service.v3.payment_providers import (
     create_payment_reconciliation,
     register_provider,
 )
+from abdm.settings import plugin_settings as abdm_settings
 
 from care.utils.time_util import care_now
 from care_razorpay import payments
@@ -57,7 +59,14 @@ class RazorpayProvider(PaymentProvider):
     def create_payment_link(self, invoice) -> dict:
         # Not stored on RazorpayPayment. ABDM tracks the link on PaymentOrder,
         # and the webhook reconciles it through reconcile_abdm_event.
-        link = payments.create_gateway_link(invoice)
+        # The link should stop being payable when ABDM gives up on the order
+        # (Razorpay rejects expiries under 15 minutes).
+        max_age = max(
+            abdm_settings.ABDM_SCAN_AND_PAY_ORDER_MAX_AGE, payments.MIN_EXPIRY_SECONDS
+        )
+        link = payments.create_gateway_link(
+            invoice, expires_at=care_now() + timedelta(seconds=max_age)
+        )
         return {
             "order_number": invoice.number or str(invoice.external_id),
             "payment_link_id": link["id"],

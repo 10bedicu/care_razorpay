@@ -6,6 +6,17 @@ from abdm.models import AbhaNumber, HealthFacility, PaymentOrder
 from abdm.models.payment_order import PaymentOrderStatus
 from abdm.service.helper import uuid
 from abdm.utils import user as abdm_user
+from care_razorpay.api.serializers.payment_link import CreatePaymentLinkRequest
+from care_razorpay.locks import RazorpayPaymentLock
+from care_razorpay.models import (
+    RazorpayAccount,
+    RazorpayPayment,
+    RazorpayQRCode,
+    RazorpayWebhookEvent,
+)
+from care_razorpay.settings import plugin_settings as settings
+from care_razorpay.webhooks import dispatch_payment_link_event
+from django.core.cache import cache
 from model_bakery import baker
 from pydantic import ValidationError
 from rest_framework import status
@@ -24,18 +35,8 @@ from care.security.permissions.payment_reconciliation import (
 from care.utils.lock import ObjectLocked
 from care.utils.tests.base import CareAPITestBase
 from care.utils.time_util import care_now
-from care_razorpay import payments, webhooks
+from care_razorpay import payments, tasks, webhooks
 from care_razorpay import provider as razorpay_provider
-from care_razorpay.api.serializers.payment_link import CreatePaymentLinkRequest
-from care_razorpay.locks import RazorpayPaymentLock
-from care_razorpay.models import (
-    RazorpayAccount,
-    RazorpayPayment,
-    RazorpayQRCode,
-    RazorpayWebhookEvent,
-)
-from care_razorpay.settings import plugin_settings as settings
-from care_razorpay.webhooks import dispatch_payment_link_event
 
 
 def _epoch(moment: datetime) -> int:
@@ -161,14 +162,47 @@ class TestRazorpayProvider(RazorpayTestBase):
         transfer = payload["options"]["order"]["transfers"][0]
         self.assertEqual(transfer["account"], "acc_test")
         self.assertEqual(transfer["amount"], 10000)
-        # scan-and-pay links expire with the local max age instead of Razorpay's 6 months
+        # scan-and-pay links expire when ABDM gives up on the order
         expected = _epoch(
-            care_now() + timedelta(seconds=settings.RAZORPAY_PAYMENT_MAX_AGE)
+            care_now()
+            + timedelta(
+                seconds=razorpay_provider.abdm_settings.ABDM_SCAN_AND_PAY_ORDER_MAX_AGE
+            )
         )
         self.assertAlmostEqual(payload["expire_by"], expected, delta=5)
         self.assertFalse(
             RazorpayPayment.objects.filter(payment_link_id="plink_test").exists()
         )
+
+    @patch("care_razorpay.payments.razorpay_client")
+    def test_create_payment_link_expiry_follows_abdm_max_age(self, mock_client):
+        mock_client.payment_link.create.return_value = {
+            "id": "plink_short",
+            "short_url": "https://rzp.io/short",
+        }
+
+        with patch.object(
+            razorpay_provider.abdm_settings, "ABDM_SCAN_AND_PAY_ORDER_MAX_AGE", 1800
+        ):
+            razorpay_provider.RazorpayProvider().create_payment_link(
+                self.make_invoice()
+            )
+
+        payload = mock_client.payment_link.create.call_args.args[0]
+        expected = _epoch(care_now() + timedelta(seconds=1800))
+        self.assertAlmostEqual(payload["expire_by"], expected, delta=5)
+
+        # Razorpay rejects expiries under 15 minutes, so that is the floor
+        with patch.object(
+            razorpay_provider.abdm_settings, "ABDM_SCAN_AND_PAY_ORDER_MAX_AGE", 60
+        ):
+            razorpay_provider.RazorpayProvider().create_payment_link(
+                self.make_invoice("INV-RZP-FLOOR")
+            )
+
+        payload = mock_client.payment_link.create.call_args.args[0]
+        expected = _epoch(care_now() + timedelta(seconds=payments.MIN_EXPIRY_SECONDS))
+        self.assertAlmostEqual(payload["expire_by"], expected, delta=5)
 
     @patch("care_razorpay.payments.razorpay_client")
     def test_create_payment_link_requires_facility_account(self, mock_client):
@@ -646,7 +680,39 @@ class TestRazorpayStandalonePayment(RazorpayTestBase):
 
         payment.refresh_from_db()
         self.assertEqual(payment.status, RazorpayPayment.Status.CREATED)
+        # an unanswered payment is left alone for the backoff period
+        self.assertEqual(mock_client.payment_link.fetch.call_count, 1)
+        self.assertTrue(cache.get(payments.backoff_key(payment)))
+
+        cache.delete(payments.backoff_key(payment))
+        payments.poll_pending_payments()
+
         self.assertEqual(mock_client.payment_link.fetch.call_count, 2)
+
+    @patch("care_razorpay.payments.razorpay_client")
+    def test_poll_backs_off_only_when_gateway_did_not_answer(self, mock_client):
+        mock_client.payment_link.fetch.return_value = {
+            "id": "plink_answered",
+            "status": "created",
+            "expire_by": _epoch(care_now() + timedelta(hours=1)),
+        }
+        payment = self.make_payment("plink_answered", "INV-ANSWERED")
+
+        payments.poll_pending_payments()
+        payments.poll_pending_payments()
+
+        self.assertEqual(mock_client.payment_link.fetch.call_count, 2)
+        self.assertIsNone(cache.get(payments.backoff_key(payment)))
+
+    @patch("care_razorpay.tasks.Lock")
+    def test_poll_task_does_nothing_when_nothing_is_pending(self, mock_lock):
+        self.make_payment(
+            "plink_settled", "INV-SETTLED", status=RazorpayPayment.Status.PAID
+        )
+
+        tasks.poll_pending_payments()
+
+        mock_lock.assert_not_called()
 
     @patch("care_razorpay.payments.razorpay_client")
     def test_poll_gives_up_after_hard_cap_and_flags_for_review(self, mock_client):

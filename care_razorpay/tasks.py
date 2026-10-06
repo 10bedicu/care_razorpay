@@ -4,6 +4,7 @@ from celery import current_app, shared_task
 
 from care.utils.lock import Lock, ObjectLocked
 from care_razorpay import payments, webhooks
+from care_razorpay.models import RazorpayPayment
 from care_razorpay.settings import plugin_settings as settings
 
 logger = logging.getLogger(__name__)
@@ -12,9 +13,11 @@ POLL_LOCK_KEY = "razorpay:poll_pending_payments"
 POLL_LOCK_TIMEOUT = 300
 
 
-@shared_task
+@shared_task(ignore_result=True)
 def poll_pending_payments() -> None:
     if not settings.RAZORPAY_POLLING_ENABLED:
+        return
+    if not RazorpayPayment.objects.filter(status__in=payments.OPEN_STATUSES).exists():
         return
     try:
         with Lock(POLL_LOCK_KEY, POLL_LOCK_TIMEOUT):
@@ -23,7 +26,7 @@ def poll_pending_payments() -> None:
         logger.info("Previous Razorpay poll is still running; skipping this tick")
 
 
-@shared_task
+@shared_task(ignore_result=True)
 def replay_failed_webhook_events() -> None:
     replayed = webhooks.replay_failed()
     if replayed:
@@ -39,8 +42,10 @@ def setup_periodic_tasks(sender, **kwargs) -> None:
     )
     if not settings.RAZORPAY_POLLING_ENABLED:
         return
+    interval = settings.RAZORPAY_POLLING_INTERVAL
+    # expiring stale runs stops a backlog of polls executing back-to-back
     sender.add_periodic_task(
-        settings.RAZORPAY_POLLING_INTERVAL,
-        poll_pending_payments.s(),
+        interval,
+        poll_pending_payments.s().set(expires=interval),
         name="razorpay_poll_pending_payments",
     )
