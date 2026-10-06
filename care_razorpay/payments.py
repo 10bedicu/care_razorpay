@@ -19,8 +19,8 @@ from care.emr.resources.payment_reconciliation.spec import (
 from care.utils.lock import ObjectLocked
 from care.utils.rounding.rounding import care_round
 from care.utils.time_util import care_now
-from care_razorpay.locks import RazorpayPaymentLock
-from care_razorpay.models import RazorpayPayment
+from care_razorpay.locks import RazorpayPaymentLock, RazorpayQRCodeLock
+from care_razorpay.models import RazorpayPayment, RazorpayQRCode
 from care_razorpay.settings import plugin_settings as settings
 from care_razorpay.utils.razorpay import razorpay_client
 
@@ -302,6 +302,127 @@ def paid_at(payment: dict | None):
     return None
 
 
+def already_reconciled(invoice, references) -> bool:
+    references = [reference for reference in references if reference]
+    if not references:
+        return False
+    return PaymentReconciliation.objects.filter(
+        target_invoice=invoice,
+        reference_number__in=references,
+    ).exists()
+
+
+def record_invoice_payment(invoice, payment: dict, note: str) -> None:
+    """Record one captured Razorpay payment (webhook or API shape) against an invoice."""
+    amount = paise_to_rupees(payment.get("amount") or 0)
+    PaymentReconciliation.objects.create(
+        target_invoice=invoice,
+        facility=invoice.facility,
+        account=invoice.account,
+        reconciliation_type=PaymentReconciliationTypeOptions.payment.value,
+        status=PaymentReconciliationStatusOptions.active.value,
+        kind=PaymentReconciliationKindOptions.online.value,
+        issuer_type=PaymentReconciliationIssuerTypeOptions.patient.value,
+        outcome=PaymentReconciliationOutcomeOptions.complete.value,
+        method=PaymentReconciliationPaymentMethodOptions.debc.value,
+        payment_datetime=paid_at(payment) or care_now(),
+        amount=amount,
+        tendered_amount=amount,
+        returned_amount=0,
+        is_credit_note=False,
+        authorization="",
+        disposition="",
+        note=note,
+        reference_number=payment.get("id"),
+    )
+    account_id = invoice.account_id
+    transaction.on_commit(lambda: rebalance_account_task.delay(account_id))
+
+
+QR_CODE_NOTE = "Payment made via Razorpay's QR code."
+
+
+def _epoch_to_datetime(value) -> datetime | None:
+    if isinstance(value, (int, float)) and value > 0:
+        return datetime.fromtimestamp(value, UTC)
+    return None
+
+
+def create_qr_record(invoice, qr: dict, usage: str) -> RazorpayQRCode:
+    amount = qr.get("payment_amount")
+    return RazorpayQRCode.objects.create(
+        qr_id=qr["id"],
+        invoice=invoice,
+        amount=paise_to_rupees(amount) if amount else None,
+        usage=usage,
+        image_url=qr.get("image_url") or "",
+        close_by=_epoch_to_datetime(qr.get("close_by")),
+        status=(qr.get("status") or RazorpayQRCode.Status.ACTIVE),
+        amount_received=paise_to_rupees(qr.get("payments_amount_received") or 0),
+        payments_count=qr.get("payments_count_received") or 0,
+    )
+
+
+def qr_record_fields(qr: dict) -> dict:
+    """Local fields to update from a gateway QR payload (API or webhook entity)."""
+    fields = {}
+    if qr.get("payments_amount_received") is not None:
+        fields["amount_received"] = paise_to_rupees(qr["payments_amount_received"])
+    if qr.get("payments_count_received") is not None:
+        fields["payments_count"] = qr["payments_count_received"]
+    if qr.get("status") in RazorpayQRCode.Status.values:
+        fields["status"] = qr["status"]
+    close_by = _epoch_to_datetime(qr.get("close_by"))
+    if close_by:
+        fields["close_by"] = close_by
+    if qr.get("image_url"):
+        fields["image_url"] = qr["image_url"]
+    return fields
+
+
+def credit_qr_payments(record: RazorpayQRCode, qr: dict, items) -> int:
+    """Record captured QR payments the webhook has not delivered yet; returns how many."""
+    recorded = 0
+    with RazorpayQRCodeLock(record.qr_id), transaction.atomic():
+        record = RazorpayQRCode.objects.select_related(
+            "invoice__account", "invoice__facility"
+        ).get(pk=record.pk)
+        for item in _payment_items(items):
+            if not isinstance(item, dict) or item.get("status") != "captured":
+                continue
+            if not item.get("id") or item.get("amount") is None:
+                continue
+            if already_reconciled(record.invoice, [item["id"]]):
+                continue
+            record_invoice_payment(record.invoice, item, QR_CODE_NOTE)
+            recorded += 1
+        for field, value in qr_record_fields(qr).items():
+            setattr(record, field, value)
+        record.save()
+    return recorded
+
+
+def fetch_gateway_qr(record: RazorpayQRCode) -> tuple[dict, list] | None:
+    """Fetch the QR code and its payments once; None when the gateway did not answer."""
+    try:
+        qr = razorpay_client.qrcode.fetch(record.qr_id)
+        result = razorpay_client.qrcode.fetch_all_payments(record.qr_id)
+    except Exception:
+        logger.exception("Failed to poll Razorpay QR code %s", record.qr_id)
+        return None
+    items = result.get("items") if isinstance(result, dict) else result
+    return qr, _payment_items(items)
+
+
+def check_qr_code(record: RazorpayQRCode) -> bool:
+    """Fetch the QR code from the gateway once and credit it; returns whether it answered."""
+    fetched = fetch_gateway_qr(record)
+    if fetched is None:
+        return False
+    credit_qr_payments(record, *fetched)
+    return True
+
+
 def _fresh(payment: RazorpayPayment) -> RazorpayPayment:
     return RazorpayPayment.objects.select_related(
         "invoice__account", "invoice__facility"
@@ -452,14 +573,21 @@ def _settle_from_link(payment: RazorpayPayment, link: dict, *, final: bool) -> N
         _finish_settlement(payment, reference, final=final)
 
 
-def check_gateway(payment: RazorpayPayment) -> bool:
-    """Fetch the link from the gateway once; returns whether it answered."""
+def fetch_gateway_link(payment: RazorpayPayment) -> dict | None:
+    """Fetch the link from the gateway once; None when it did not answer."""
     try:
-        link = razorpay_client.payment_link.fetch(payment.payment_link_id)
+        return razorpay_client.payment_link.fetch(payment.payment_link_id)
     except Exception:
         logger.exception(
             "Failed to poll Razorpay status for link %s", payment.payment_link_id
         )
+        return None
+
+
+def check_gateway(payment: RazorpayPayment) -> bool:
+    """Fetch the link from the gateway once and apply it; returns whether it answered."""
+    link = fetch_gateway_link(payment)
+    if link is None:
         return False
     apply_gateway_status(payment, link)
     return True

@@ -28,7 +28,12 @@ from care_razorpay import payments, webhooks
 from care_razorpay import provider as razorpay_provider
 from care_razorpay.api.serializers.payment_link import CreatePaymentLinkRequest
 from care_razorpay.locks import RazorpayPaymentLock
-from care_razorpay.models import RazorpayAccount, RazorpayPayment, RazorpayWebhookEvent
+from care_razorpay.models import (
+    RazorpayAccount,
+    RazorpayPayment,
+    RazorpayQRCode,
+    RazorpayWebhookEvent,
+)
 from care_razorpay.settings import plugin_settings as settings
 from care_razorpay.webhooks import dispatch_payment_link_event
 
@@ -850,7 +855,7 @@ class TestRazorpayWebhookDispatch(RazorpayTestBase):
         self.assertIn("Scan and pay", reconciliations.get().note)
         mock_task.assert_called_once()
 
-    @patch("care_razorpay.webhooks.rebalance_account_task.delay")
+    @patch("care_razorpay.payments.rebalance_account_task.delay")
     def test_legacy_notes_reconcile_when_link_is_unknown(self, mock_rebalance):
         invoice = self.make_invoice("INV-LEGACY")
 
@@ -876,7 +881,7 @@ class TestRazorpayWebhookDispatch(RazorpayTestBase):
         response = dispatch_payment_link_event({"event": "payment_link.paid"})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    @patch("care_razorpay.webhooks.rebalance_account_task.delay")
+    @patch("care_razorpay.payments.rebalance_account_task.delay")
     def test_qr_code_credit_is_recorded_once(self, mock_rebalance):
         invoice = self.make_invoice("INV-QR")
         event = {
@@ -907,6 +912,36 @@ class TestRazorpayWebhookDispatch(RazorpayTestBase):
         self.assertEqual(reconciliation.amount, Decimal("25.50"))
         self.assertEqual(reconciliation.reference_number, "pay_qr")
         mock_rebalance.assert_called_once()
+
+    def test_qr_code_credit_updates_local_record(self):
+        invoice = self.make_invoice("INV-QR-REC")
+        record = RazorpayQRCode.objects.create(
+            qr_id="qr_rec", invoice=invoice, amount=invoice.total_gross
+        )
+        event = {
+            "event": "qr_code.credited",
+            "payload": {
+                "payment": {"entity": {"id": "pay_rec", "amount": 10000}},
+                "qr_code": {
+                    "entity": {
+                        "id": "qr_rec",
+                        "status": "closed",
+                        "payments_amount_received": 10000,
+                        "payments_count_received": 1,
+                        "notes": {"invoice_id": str(invoice.external_id)},
+                    }
+                },
+            },
+        }
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = webhooks.dispatch_qr_code_event(event)
+
+        self.assertEqual(response.status_code, 200)
+        record.refresh_from_db()
+        self.assertEqual(record.status, RazorpayQRCode.Status.CLOSED)
+        self.assertEqual(record.amount_received, Decimal(100))
+        self.assertEqual(record.payments_count, 1)
 
 
 WEBHOOK_URL = "/api/care_razorpay/webhook/payment_link/"
@@ -1187,8 +1222,273 @@ class TestRazorpayCollectionAPI(RazorpayTestBase):
         self.assertEqual(
             mock_client.qrcode.create.call_args.args[0]["payment_amount"], 7000
         )
+        record = RazorpayQRCode.objects.get(qr_id="qr_1")
+        self.assertEqual(record.invoice, invoice)
+        self.assertEqual(record.amount, Decimal("70.00"))
+        self.assertEqual(record.usage, "single_use")
+        self.assertEqual(record.status, RazorpayQRCode.Status.ACTIVE)
 
         self.client.force_authenticate(user=self.create_user())
         self.assertEqual(
             self.client.post(QR_CODE_URL, body, format="json").status_code, 403
         )
+
+    def make_link_record(self, link_id, invoice, **fields):
+        return RazorpayPayment.objects.create(
+            payment_link_id=link_id,
+            invoice=invoice,
+            amount=invoice.total_gross,
+            payment_url=f"https://rzp.io/{link_id}",
+            **fields,
+        )
+
+    def test_lists_links_for_invoice_newest_first(self):
+        invoice = self.make_invoice("INV-LINK-LIST")
+        self.make_link_record(
+            "plink_old", invoice, status=RazorpayPayment.Status.SUPERSEDED
+        )
+        self.make_link_record("plink_live", invoice)
+        self.make_payment("plink_other", "INV-ELSEWHERE")
+
+        response = self.client.get(
+            PAYMENT_LINK_URL, {"invoice": str(invoice.external_id)}
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(
+            [row["payment_link_id"] for row in response.data["results"]],
+            ["plink_live", "plink_old"],
+        )
+        row = response.data["results"][0]
+        self.assertEqual(row["invoice_id"], str(invoice.external_id))
+        self.assertEqual(row["payment_url"], "https://rzp.io/plink_live")
+        self.assertEqual(row["status"], "created")
+
+        response = self.client.get(
+            PAYMENT_LINK_URL,
+            {"invoice": str(invoice.external_id), "status": "created"},
+        )
+
+        self.assertEqual(
+            [row["payment_link_id"] for row in response.data["results"]],
+            ["plink_live"],
+        )
+
+    def test_list_requires_invoice_and_permission(self):
+        invoice = self.make_invoice("INV-LINK-403")
+
+        self.assertEqual(self.client.get(PAYMENT_LINK_URL).status_code, 400)
+        self.assertEqual(
+            self.client.get(PAYMENT_LINK_URL, {"invoice": str(uuid())}).status_code,
+            404,
+        )
+
+        self.client.force_authenticate(user=self.create_user())
+        response = self.client.get(
+            PAYMENT_LINK_URL, {"invoice": str(invoice.external_id)}
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    @patch("care_razorpay.payments.razorpay_client")
+    def test_refresh_settles_paid_link_locally(self, mock_client):
+        invoice = self.make_invoice("INV-LINK-REFRESH")
+        payment = self.make_link_record("plink_refresh", invoice)
+        link = self.link("plink_refresh")
+        link.update(
+            status="paid",
+            amount_paid=10000,
+            payments=[
+                {
+                    "id": "pay_refresh",
+                    "amount": 10000,
+                    "status": "captured",
+                    "created_at": 1_700_000_000,
+                }
+            ],
+        )
+        mock_client.payment_link.fetch.return_value = link
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post(f"{PAYMENT_LINK_URL}plink_refresh/refresh/")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertTrue(response.data["gateway_checked"])
+        self.assertEqual(response.data["payment"]["status"], "paid")
+        self.assertEqual(response.data["payment"]["reference"], "pay_refresh")
+        self.assertEqual(response.data["link"]["amount_paid"], 100.0)
+        payment.refresh_from_db()
+        self.assertEqual(payment.status, RazorpayPayment.Status.PAID)
+        reconciliation = PaymentReconciliation.objects.get(target_invoice=invoice)
+        self.assertEqual(reconciliation.reference_number, "pay_refresh")
+        self.assertEqual(reconciliation.amount, Decimal(100))
+
+    @patch("care_razorpay.payments.razorpay_client")
+    def test_refresh_reports_unreachable_gateway(self, mock_client):
+        invoice = self.make_invoice("INV-LINK-DOWN")
+        self.make_link_record("plink_down", invoice)
+        mock_client.payment_link.fetch.side_effect = RuntimeError("gateway down")
+
+        response = self.client.post(f"{PAYMENT_LINK_URL}plink_down/refresh/")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertFalse(response.data["gateway_checked"])
+        self.assertIsNone(response.data["link"])
+        self.assertEqual(response.data["payment"]["status"], "created")
+
+    @patch("care_razorpay.payments.razorpay_client")
+    def test_refresh_requires_permission_and_known_link(self, mock_client):
+        self.assertEqual(
+            self.client.post(f"{PAYMENT_LINK_URL}plink_nope/refresh/").status_code,
+            404,
+        )
+        invoice = self.make_invoice("INV-LINK-PRIV")
+        self.make_link_record("plink_priv", invoice)
+        self.client.force_authenticate(user=self.create_user())
+
+        response = self.client.post(f"{PAYMENT_LINK_URL}plink_priv/refresh/")
+
+        self.assertEqual(response.status_code, 403)
+        mock_client.payment_link.fetch.assert_not_called()
+
+    def make_qr_record(self, qr_id, invoice, **fields):
+        return RazorpayQRCode.objects.create(
+            qr_id=qr_id,
+            invoice=invoice,
+            amount=invoice.total_gross,
+            image_url=f"https://rzp.io/{qr_id}.png",
+            usage="single_use",
+            **fields,
+        )
+
+    def gateway_qr(self, qr_id, received=0, count=0, qr_status="active"):
+        return {
+            "id": qr_id,
+            "image_url": f"https://rzp.io/{qr_id}.png",
+            "created_at": 1_700_000_000,
+            "payment_amount": 10000,
+            "payments_amount_received": received,
+            "payments_count_received": count,
+            "status": qr_status,
+        }
+
+    @patch("care_razorpay.api.viewsets.qr_code.razorpay_client")
+    def test_qr_code_retrieve_is_scoped_to_known_codes(self, mock_client):
+        mock_client.qrcode.fetch.return_value = self.gateway_qr("qr_known")
+        self.make_qr_record("qr_known", self.make_invoice("INV-QR-KNOWN"))
+
+        known = self.client.get(f"{QR_CODE_URL}qr_known/")
+        unknown = self.client.get(f"{QR_CODE_URL}qr_other/")
+
+        self.assertEqual(known.status_code, 200, known.data)
+        self.assertEqual(unknown.status_code, 404)
+        mock_client.qrcode.fetch.assert_called_once_with("qr_known")
+
+        self.client.force_authenticate(user=self.create_user())
+        self.assertEqual(self.client.get(f"{QR_CODE_URL}qr_known/").status_code, 403)
+
+    def test_lists_qr_codes_for_invoice(self):
+        invoice = self.make_invoice("INV-QR-LIST")
+        self.make_qr_record("qr_closed", invoice, status=RazorpayQRCode.Status.CLOSED)
+        self.make_qr_record("qr_open", invoice)
+        self.make_qr_record("qr_elsewhere", self.make_invoice("INV-QR-OTHER"))
+
+        response = self.client.get(QR_CODE_URL, {"invoice": str(invoice.external_id)})
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(
+            [row["qr_id"] for row in response.data["results"]], ["qr_open", "qr_closed"]
+        )
+        self.assertEqual(response.data["results"][0]["amount"], "100.00")
+
+        response = self.client.get(
+            QR_CODE_URL, {"invoice": str(invoice.external_id), "status": "active"}
+        )
+        self.assertEqual(
+            [row["qr_id"] for row in response.data["results"]], ["qr_open"]
+        )
+
+    @patch("care_razorpay.payments.razorpay_client")
+    def test_qr_code_refresh_credits_unseen_payments_once(self, mock_client):
+        invoice = self.make_invoice("INV-QR-REFRESH")
+        record = self.make_qr_record("qr_refresh", invoice)
+        mock_client.qrcode.fetch.return_value = self.gateway_qr(
+            "qr_refresh", received=2550, count=1, qr_status="closed"
+        )
+        mock_client.qrcode.fetch_all_payments.return_value = {
+            "entity": "collection",
+            "count": 2,
+            "items": [
+                {
+                    "id": "pay_qr_ok",
+                    "amount": 2550,
+                    "status": "captured",
+                    "created_at": 1_700_000_000,
+                },
+                {"id": "pay_qr_failed", "amount": 2550, "status": "failed"},
+            ],
+        }
+
+        with self.captureOnCommitCallbacks(execute=True):
+            first = self.client.post(f"{QR_CODE_URL}qr_refresh/refresh/")
+            second = self.client.post(f"{QR_CODE_URL}qr_refresh/refresh/")
+
+        self.assertEqual(first.status_code, 200, first.data)
+        self.assertTrue(first.data["gateway_checked"])
+        self.assertEqual(first.data["qr_code"]["status"], "closed")
+        self.assertEqual(first.data["qr_code"]["amount_received"], "25.50")
+        self.assertEqual(first.data["gateway"]["payments_amount_received"], 25.5)
+        self.assertEqual(second.status_code, 200)
+        reconciliations = PaymentReconciliation.objects.filter(target_invoice=invoice)
+        self.assertEqual(reconciliations.count(), 1)
+        reconciliation = reconciliations.get()
+        self.assertEqual(reconciliation.reference_number, "pay_qr_ok")
+        self.assertEqual(reconciliation.amount, Decimal("25.50"))
+        self.assertIn("QR code", reconciliation.note)
+        record.refresh_from_db()
+        self.assertEqual(record.status, RazorpayQRCode.Status.CLOSED)
+        self.assertEqual(record.payments_count, 1)
+
+    @patch("care_razorpay.payments.razorpay_client")
+    def test_qr_code_refresh_skips_payments_the_webhook_recorded(self, mock_client):
+        invoice = self.make_invoice("INV-QR-WEBHOOKED")
+        self.make_qr_record("qr_hooked", invoice)
+        self.record_payment(invoice, 25.5, reference="pay_hooked")
+        mock_client.qrcode.fetch.return_value = self.gateway_qr(
+            "qr_hooked", received=2550, count=1
+        )
+        mock_client.qrcode.fetch_all_payments.return_value = {
+            "items": [{"id": "pay_hooked", "amount": 2550, "status": "captured"}]
+        }
+
+        response = self.client.post(f"{QR_CODE_URL}qr_hooked/refresh/")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(
+            PaymentReconciliation.objects.filter(target_invoice=invoice).count(), 1
+        )
+
+    @patch("care_razorpay.payments.razorpay_client")
+    def test_qr_code_refresh_reports_unreachable_gateway(self, mock_client):
+        invoice = self.make_invoice("INV-QR-DOWN")
+        self.make_qr_record("qr_down", invoice)
+        mock_client.qrcode.fetch.side_effect = RuntimeError("gateway down")
+
+        response = self.client.post(f"{QR_CODE_URL}qr_down/refresh/")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertFalse(response.data["gateway_checked"])
+        self.assertIsNone(response.data["gateway"])
+        self.assertEqual(response.data["qr_code"]["status"], "active")
+
+    @patch("care_razorpay.payments.razorpay_client")
+    def test_qr_code_refresh_requires_permission(self, mock_client):
+        invoice = self.make_invoice("INV-QR-PRIV")
+        self.make_qr_record("qr_priv", invoice)
+        self.client.force_authenticate(user=self.create_user())
+
+        response = self.client.post(f"{QR_CODE_URL}qr_priv/refresh/")
+
+        self.assertEqual(response.status_code, 403)
+        mock_client.qrcode.fetch.assert_not_called()

@@ -65,13 +65,13 @@ class RazorpayProvider(PaymentProvider):
             "amount": invoice.total_gross,
         }
 
-    def reconcile_order(self, order) -> None:
+    def reconcile_order(self, order) -> bool:
         if (
             not order.invoice_id
             or not order.payment_link_id
             or order.status in PAYMENT_ORDER_PAID_STATUSES
         ):
-            return
+            return False
         link = payments.razorpay_client.payment_link.fetch(order.payment_link_id)
         status = (link.get("status") or "").lower()
         if status == "paid":
@@ -82,7 +82,7 @@ class RazorpayProvider(PaymentProvider):
                 reference,
                 amount=payments.paise_to_rupees(amount_paid) if amount_paid else None,
             )
-            return
+            return True
 
         expires_at = payments.link_expires_at(link)
         if status == "expired" or (expires_at and expires_at <= care_now()):
@@ -95,3 +95,4 @@ class RazorpayProvider(PaymentProvider):
                 order.order_number,
                 link.get("status"),
             )
+        return True

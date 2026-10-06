@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 from enum import Enum
 
 from pydantic import UUID4, BaseModel, field_validator, model_validator
@@ -66,3 +67,37 @@ class QRCode(BaseModel):
     @classmethod
     def convert_amount_to_float(cls, value):
         return value / 100
+
+
+class QRCodeRecord(BaseModel):
+    """What CARE knows about a QR code, independent of the gateway."""
+
+    id: UUID4
+    invoice_id: UUID4
+    qr_id: str
+    image_url: str
+    amount: Decimal | None = None
+    usage: str = ""
+    close_by: datetime | None = None
+    status: str
+    amount_received: Decimal
+    payments_count: int
+    created_date: datetime
+    modified_date: datetime
+
+    @classmethod
+    def from_record(cls, record) -> "QRCodeRecord":
+        return cls(
+            id=record.external_id,
+            invoice_id=record.invoice.external_id,
+            qr_id=record.qr_id,
+            image_url=record.image_url,
+            amount=record.amount,
+            usage=record.usage,
+            close_by=record.close_by,
+            status=record.status,
+            amount_received=record.amount_received,
+            payments_count=record.payments_count,
+            created_date=record.created_date,
+            modified_date=record.modified_date,
+        )

@@ -6,19 +6,9 @@ from rest_framework import status
 from rest_framework.response import Response
 
 from care.emr.models.invoice import Invoice
-from care.emr.models.payment_reconciliation import PaymentReconciliation
-from care.emr.resources.account.sync_items import rebalance_account_task
-from care.emr.resources.payment_reconciliation.spec import (
-    PaymentReconciliationIssuerTypeOptions,
-    PaymentReconciliationKindOptions,
-    PaymentReconciliationOutcomeOptions,
-    PaymentReconciliationPaymentMethodOptions,
-    PaymentReconciliationStatusOptions,
-    PaymentReconciliationTypeOptions,
-)
-from care.utils.time_util import care_now
 from care_razorpay import payments
-from care_razorpay.models import RazorpayWebhookEvent
+from care_razorpay.locks import RazorpayQRCodeLock
+from care_razorpay.models import RazorpayQRCode, RazorpayWebhookEvent
 from care_razorpay.settings import plugin_settings as settings
 
 logger = logging.getLogger(__name__)
@@ -37,42 +27,6 @@ def _reconcile_via_abdm(payment_link: dict, payment: dict | None, event: str) ->
     return reconcile_abdm_event(payment_link, payment, event)
 
 
-def _already_reconciled(invoice, references) -> bool:
-    references = [reference for reference in references if reference]
-    if not references:
-        return False
-    return PaymentReconciliation.objects.filter(
-        target_invoice=invoice,
-        reference_number__in=references,
-    ).exists()
-
-
-def _record_invoice_payment(invoice, payment: dict, note: str) -> None:
-    amount = payments.paise_to_rupees(payment.get("amount") or 0)
-    PaymentReconciliation.objects.create(
-        target_invoice=invoice,
-        facility=invoice.facility,
-        account=invoice.account,
-        reconciliation_type=PaymentReconciliationTypeOptions.payment.value,
-        status=PaymentReconciliationStatusOptions.active.value,
-        kind=PaymentReconciliationKindOptions.online.value,
-        issuer_type=PaymentReconciliationIssuerTypeOptions.patient.value,
-        outcome=PaymentReconciliationOutcomeOptions.complete.value,
-        method=PaymentReconciliationPaymentMethodOptions.debc.value,
-        payment_datetime=payments.paid_at(payment) or care_now(),
-        amount=amount,
-        tendered_amount=amount,
-        returned_amount=0,
-        is_credit_note=False,
-        authorization="",
-        disposition="",
-        note=note,
-        reference_number=payment.get("id"),
-    )
-    account_id = invoice.account_id
-    transaction.on_commit(lambda: rebalance_account_task.delay(account_id))
-
-
 def _reconcile_from_invoice_notes(payment: dict, payment_link: dict) -> Response:
     notes = payment_link.get("notes", {})
     invoice_id = notes.get("invoice_id")
@@ -84,10 +38,12 @@ def _reconcile_from_invoice_notes(payment: dict, payment_link: dict) -> Response
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    if _already_reconciled(invoice, [payment.get("id"), payment_link.get("id")]):
+    if payments.already_reconciled(
+        invoice, [payment.get("id"), payment_link.get("id")]
+    ):
         return Response(status=status.HTTP_200_OK)
 
-    _record_invoice_payment(
+    payments.record_invoice_payment(
         invoice, payment, "Payment made via Razorpay's payment link."
     )
     return Response(status=status.HTTP_200_OK)
@@ -142,10 +98,15 @@ def dispatch_qr_code_event(data: dict) -> Response:
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    if _already_reconciled(invoice, [payment.get("id")]):
-        return Response(status=status.HTTP_200_OK)
-
-    _record_invoice_payment(invoice, payment, "Payment made via Razorpay's QR code.")
+    with RazorpayQRCodeLock(qr_code.get("id") or "unknown"), transaction.atomic():
+        if payments.already_reconciled(invoice, [payment.get("id")]):
+            return Response(status=status.HTTP_200_OK)
+        payments.record_invoice_payment(invoice, payment, payments.QR_CODE_NOTE)
+        record = RazorpayQRCode.objects.filter(qr_id=qr_code.get("id")).first()
+        if record:
+            for field, value in payments.qr_record_fields(qr_code).items():
+                setattr(record, field, value)
+            record.save()
     return Response(status=status.HTTP_200_OK)
 
 

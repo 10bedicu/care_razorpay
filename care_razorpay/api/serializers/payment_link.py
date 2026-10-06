@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from enum import Enum
 
 from django.core.validators import validate_email
@@ -91,3 +92,37 @@ class PaymentLink(BaseModel):
     @classmethod
     def convert_amount_to_float(cls, value):
         return value / 100
+
+
+class PaymentRecord(BaseModel):
+    """What CARE knows about a payment link, independent of the gateway."""
+
+    id: UUID4
+    invoice_id: UUID4
+    payment_link_id: str
+    payment_url: str
+    amount: Decimal
+    status: str
+    reference: str = ""
+    expires_at: datetime | None = None
+    needs_review: bool = False
+    review_reason: str = ""
+    created_date: datetime
+    modified_date: datetime
+
+    @classmethod
+    def from_payment(cls, payment) -> "PaymentRecord":
+        return cls(
+            id=payment.external_id,
+            invoice_id=payment.invoice.external_id,
+            payment_link_id=payment.payment_link_id,
+            payment_url=payment.payment_url,
+            amount=payment.amount,
+            status=payment.status,
+            reference=payment.reference,
+            expires_at=payment.expires_at,
+            needs_review=payment.needs_review,
+            review_reason=payment.review_reason,
+            created_date=payment.created_date,
+            modified_date=payment.modified_date,
+        )
