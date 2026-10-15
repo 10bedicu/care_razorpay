@@ -80,7 +80,7 @@ The following configurations variables are available for Care Razorpay:
 - `RAZORPAY_KEY_ID`: Razorpay API key
 - `RAZORPAY_KEY_SECRET`: Razorpay API secret
 - `RAZORPAY_WEBHOOK_SECRET`: Razorpay webhook secret
-- `RAZORPAY_POLLING_ENABLED`: Enable the Celery status-polling task (default `True`)
+- `RAZORPAY_POLLING_ENABLED`: Enable the Celery status-polling task (default `False`; set `true` in the environment to turn it on)
 - `RAZORPAY_POLLING_INTERVAL`: Polling interval in seconds (default `10`)
 - `RAZORPAY_PAYMENT_MAX_AGE`: Seconds a payment link stays payable when the
   request gives no `expires_at` (default `3600`, minimum 15 minutes per Razorpay)

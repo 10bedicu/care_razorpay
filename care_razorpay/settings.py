@@ -107,7 +107,7 @@ DEFAULTS = {
     "RAZORPAY_KEY_ID": "",
     "RAZORPAY_KEY_SECRET": "",
     "RAZORPAY_WEBHOOK_SECRET": "",
-    "RAZORPAY_POLLING_ENABLED": True,
+    "RAZORPAY_POLLING_ENABLED": False,
     "RAZORPAY_POLLING_INTERVAL": 10,
     "RAZORPAY_PAYMENT_MAX_AGE": 3600,
     # keep polling a locally expired link this long for late gateway updates
