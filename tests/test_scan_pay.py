@@ -894,6 +894,46 @@ class TestRazorpayWebhookDispatch(RazorpayTestBase):
         reconciliation = PaymentReconciliation.objects.get(target_invoice=invoice)
         self.assertEqual(reconciliation.method, "debc")
 
+    def _terminal_event(self, event, link_id):
+        return {
+            "event": event,
+            "payload": {"payment_link": {"entity": {"id": link_id}}},
+        }
+
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
+    def test_cancelled_link_closes_scan_pay_order(self, mock_task):
+        order = self.make_order("plink_cancel")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = dispatch_payment_link_event(
+                self._terminal_event("payment_link.cancelled", "plink_cancel")
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        order.refresh_from_db()
+        order.invoice.refresh_from_db()
+        self.assertEqual(order.status, PaymentOrderStatus.CANCELED)
+        self.assertEqual(
+            order.invoice.status, InvoiceStatusOptions.entered_in_error.value
+        )
+        payload = mock_task.call_args.args[0]
+        self.assertEqual(payload["acknowledgement"]["status"], "CANCELED")
+
+    @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
+    def test_expired_link_closes_scan_pay_order(self, mock_task):
+        order = self.make_order("plink_expired")
+
+        with self.captureOnCommitCallbacks(execute=True):
+            response = dispatch_payment_link_event(
+                self._terminal_event("payment_link.expired", "plink_expired")
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        order.refresh_from_db()
+        self.assertEqual(order.status, PaymentOrderStatus.FAIL)
+        payload = mock_task.call_args.args[0]
+        self.assertEqual(payload["acknowledgement"]["status"], "FAIL")
+
     @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     def test_unknown_link_falls_through_to_abdm(self, mock_task):
         order = self.make_order("plink_abdm")

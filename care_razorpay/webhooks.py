@@ -64,11 +64,7 @@ def dispatch_payment_link_event(data: dict) -> Response:
     if payment_link and payments.reconcile_event(payment_link, payment, event):
         return Response(status=status.HTTP_200_OK)
 
-    if (
-        payment_link
-        and event in PAID_EVENTS
-        and _reconcile_via_abdm(payment_link, payment, event)
-    ):
+    if payment_link and _reconcile_via_abdm(payment_link, payment, event):
         return Response(status=status.HTTP_200_OK)
 
     if event in PAID_EVENTS:
