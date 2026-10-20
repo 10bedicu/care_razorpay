@@ -11,6 +11,7 @@ from abdm.service.v3.payment_providers import (
     close_payment_order,
     create_payment_reconciliation,
     register_provider,
+    remember_transaction_reference,
 )
 from abdm.settings import plugin_settings as abdm_settings
 
@@ -49,10 +50,11 @@ def apply_scan_pay_status(order, status: str, *, reference: str, amount=None) ->
     if status == "paid":
         create_payment_reconciliation(order, reference, amount=amount)
     elif status == "cancelled":
-        close_payment_order(order, PaymentOrderStatus.CANCELED)
+        close_payment_order(order, PaymentOrderStatus.CANCELED, reference=reference)
     elif status == "expired":
-        close_payment_order(order, PaymentOrderStatus.EXPIRED)
+        close_payment_order(order, PaymentOrderStatus.EXPIRED, reference=reference)
     else:
+        remember_transaction_reference(order, reference)
         logger.info(
             "Razorpay order %s not paid, status %s", order.order_number, status
         )

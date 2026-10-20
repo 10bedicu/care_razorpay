@@ -281,6 +281,7 @@ class TestRazorpayProvider(RazorpayTestBase):
         mock_client.payment_link.fetch.return_value = {
             "id": "plink_test",
             "status": "expired",
+            "payments": [{"id": "pay_expired", "amount": 10000, "status": "captured"}],
         }
         order = self.make_order("plink_test")
 
@@ -289,9 +290,8 @@ class TestRazorpayProvider(RazorpayTestBase):
 
         order.refresh_from_db()
         self.assertEqual(order.status, PaymentOrderStatus.EXPIRED)
-        self.assertEqual(
-            order.invoice.status, InvoiceStatusOptions.entered_in_error.value
-        )
+        self.assertEqual(order.transaction_id, "pay_expired")
+        self.assertEqual(order.invoice.status, InvoiceStatusOptions.cancelled.value)
         self.assertFalse(
             PaymentReconciliation.objects.filter(target_invoice=order.invoice).exists()
         )
@@ -912,9 +912,8 @@ class TestRazorpayWebhookDispatch(RazorpayTestBase):
         order.refresh_from_db()
         order.invoice.refresh_from_db()
         self.assertEqual(order.status, PaymentOrderStatus.CANCELED)
-        self.assertEqual(
-            order.invoice.status, InvoiceStatusOptions.entered_in_error.value
-        )
+        self.assertFalse(order.transaction_id)
+        self.assertEqual(order.invoice.status, InvoiceStatusOptions.cancelled.value)
         payload = mock_task.call_args.args[0]
         self.assertEqual(payload["acknowledgement"]["status"], "CANCELED")
 
