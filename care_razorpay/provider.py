@@ -51,7 +51,7 @@ def apply_scan_pay_status(order, status: str, *, reference: str, amount=None) ->
     elif status == "cancelled":
         close_payment_order(order, PaymentOrderStatus.CANCELED)
     elif status == "expired":
-        close_payment_order(order, PaymentOrderStatus.FAIL)
+        close_payment_order(order, PaymentOrderStatus.EXPIRED)
     else:
         logger.info(
             "Razorpay order %s not paid, status %s", order.order_number, status

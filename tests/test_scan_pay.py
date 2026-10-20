@@ -288,16 +288,15 @@ class TestRazorpayProvider(RazorpayTestBase):
             razorpay_provider.RazorpayProvider().reconcile_order(order)
 
         order.refresh_from_db()
-        self.assertEqual(order.status, PaymentOrderStatus.FAIL)
+        self.assertEqual(order.status, PaymentOrderStatus.EXPIRED)
         self.assertEqual(
             order.invoice.status, InvoiceStatusOptions.entered_in_error.value
         )
         self.assertFalse(
             PaymentReconciliation.objects.filter(target_invoice=order.invoice).exists()
         )
-        # the PHR is told the payment failed
         payload = mock_task.call_args.args[0]
-        self.assertEqual(payload["acknowledgement"]["status"], "FAIL")
+        self.assertEqual(payload["acknowledgement"]["status"], "EXPIRED")
 
     @patch("care_razorpay.payments.razorpay_client")
     def test_reconcile_fails_order_past_expire_by(self, mock_client):
@@ -311,7 +310,7 @@ class TestRazorpayProvider(RazorpayTestBase):
         razorpay_provider.RazorpayProvider().reconcile_order(order)
 
         order.refresh_from_db()
-        self.assertEqual(order.status, PaymentOrderStatus.FAIL)
+        self.assertEqual(order.status, PaymentOrderStatus.EXPIRED)
 
     @patch("care_razorpay.payments.razorpay_client")
     def test_reconcile_cancels_cancelled_order(self, mock_client):
@@ -930,9 +929,9 @@ class TestRazorpayWebhookDispatch(RazorpayTestBase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         order.refresh_from_db()
-        self.assertEqual(order.status, PaymentOrderStatus.FAIL)
+        self.assertEqual(order.status, PaymentOrderStatus.EXPIRED)
         payload = mock_task.call_args.args[0]
-        self.assertEqual(payload["acknowledgement"]["status"], "FAIL")
+        self.assertEqual(payload["acknowledgement"]["status"], "EXPIRED")
 
     @patch("abdm.tasks.scan_pay.scan_pay_notify.delay")
     def test_unknown_link_falls_through_to_abdm(self, mock_task):
